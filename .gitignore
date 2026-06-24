@@ -1,0 +1,17 @@
+node_modules/
+dist/
+*.local
+.env
+.env.*
+.DS_Store
+Thumbs.db
+*.log
+
+# CAD working files dropped into samples/ (keep the folder, ignore large binaries)
+/samples/*.stp
+/samples/*.step
+/samples/*.STP
+/samples/*.STEP
+/samples/*.dxf
+/samples/*.DXF
+!/samples/README.md

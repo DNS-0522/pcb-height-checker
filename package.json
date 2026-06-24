@@ -1,0 +1,19 @@
+{
+  "name": "pcb-height-checker",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Compare PCB DXF revisions and validate component heights against DXF height-limit zones using STP (STEP) 3D models.",
+  "workspaces": [
+    "client",
+    "server"
+  ],
+  "scripts": {
+    "dev": "concurrently -n CLIENT,SERVER -c blue,green \"npm:dev:client\" \"npm:dev:server\"",
+    "dev:client": "npm run dev -w client",
+    "dev:server": "npm run dev -w server",
+    "build": "npm run build -w client && npm run build -w server"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.0"
+  }
+}
