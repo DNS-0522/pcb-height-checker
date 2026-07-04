@@ -1,0 +1,3 @@
+# 可重新產生的探勘產物，不進 git
+renders/
+stp_components.csv

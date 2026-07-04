@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import {
   CircuitBoard,
   Sun,
@@ -9,26 +9,33 @@ import {
   AlertTriangle,
   Ruler,
   Layers,
+  Search,
+  Tag,
 } from 'lucide-react';
-import { cn } from './lib/utils';
+import { cn, fmt } from './lib/utils';
 
-type Vec3 = [number, number, number];
-type BBox = { min: Vec3; max: Vec3 };
-
-interface Component {
-  name: string;
-  meshCount: number;
-  bbox: BBox;
-  size: Vec3;
+interface StepComponent {
+  id: string;
+  footprint: string;
+  x: number;
+  y: number;
+  z: number;
+  width: number;
+  depth: number;
   height: number;
+  side: 'top' | 'bottom';
+  isRefdes: boolean;
 }
 
-interface ParseResult {
-  meshCount: number;
+interface StepResult {
   componentCount: number;
-  overall: { min: Vec3; max: Vec3; size: Vec3 } | null;
-  components: Component[];
+  refdesCount: number;
+  board: { width: number; depth: number; height: number } | null;
+  components: StepComponent[];
+  parseMs: number;
 }
+
+const ROW_CAP = 300;
 
 function useTheme() {
   const [dark, setDark] = useState(() => localStorage.getItem('theme') === 'dark');
@@ -45,15 +52,14 @@ function useTheme() {
   return { dark, toggle: () => setDark((d) => !d) };
 }
 
-const fmt = (n: number | undefined, digits = 2) =>
-  typeof n === 'number' && Number.isFinite(n) ? n.toFixed(digits) : '—';
-
 export default function App() {
   const { dark, toggle } = useTheme();
   const [file, setFile] = useState<File | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [result, setResult] = useState<ParseResult | null>(null);
+  const [result, setResult] = useState<StepResult | null>(null);
+  const [query, setQuery] = useState('');
+  const [side, setSide] = useState<'all' | 'top' | 'bottom'>('all');
   const inputRef = useRef<HTMLInputElement>(null);
 
   async function handleParse() {
@@ -67,13 +73,29 @@ export default function App() {
       const res = await fetch('/api/stp/parse', { method: 'POST', body: fd });
       const data = await res.json();
       if (!res.ok) throw new Error(data?.error || `HTTP ${res.status}`);
-      setResult(data as ParseResult);
+      setResult(data as StepResult);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Parse failed');
     } finally {
       setLoading(false);
     }
   }
+
+  const sideCounts = useMemo(() => {
+    const top = result?.components.filter((c) => c.side === 'top').length ?? 0;
+    return { top, bottom: (result?.componentCount ?? 0) - top };
+  }, [result]);
+
+  const filtered = useMemo(() => {
+    if (!result) return [];
+    const q = query.trim().toLowerCase();
+    return result.components
+      .filter((c) => side === 'all' || c.side === side)
+      .filter((c) => !q || c.id.toLowerCase().includes(q) || c.footprint.toLowerCase().includes(q))
+      .sort((a, b) => b.height - a.height);
+  }, [result, query, side]);
+
+  const shown = filtered.slice(0, ROW_CAP);
 
   return (
     <div className="min-h-screen bg-slate-50 dark:bg-slate-900 text-slate-900 dark:text-slate-100 transition-colors duration-200">
@@ -83,7 +105,7 @@ export default function App() {
             <CircuitBoard className="w-6 h-6 text-blue-600 dark:text-blue-400" />
             <div>
               <h1 className="text-xl font-bold leading-none">PCB Height Checker</h1>
-              <p className="text-xs text-slate-500 mt-1">Phase 0 · STP 解析驗證</p>
+              <p className="text-xs text-slate-500 mt-1">STP 零件高度解析</p>
             </div>
           </div>
           <button
@@ -103,7 +125,7 @@ export default function App() {
             <span>上傳 STP / STEP 模型</span>
           </h2>
           <p className="text-sm text-slate-500 mb-4">
-            驗證後端能否用 OpenCascade 解析 3D 模型，並逐件算出邊界框與高度。目前假設 <span className="font-mono">Z</span> 軸為高度方向（之後可依實際檔案調整）。
+            解析 PCB 組裝體，逐件取出 <span className="font-mono">refdes</span>、封裝、座標、尺寸、高度與正/反面（純文字解析，秒級）。
           </p>
           <div className="flex flex-col sm:flex-row sm:items-center gap-3">
             <input
@@ -147,72 +169,100 @@ export default function App() {
 
         {result && (
           <>
-            <section className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+            <section className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+              <StatTile label="零件總數" value={String(result.componentCount)} icon={<Layers className="w-4 h-4" />} accent />
+              <StatTile label="含 refdes" value={String(result.refdesCount)} icon={<Tag className="w-4 h-4" />} />
               <StatTile
-                label="零件數 (top-level)"
-                value={String(result.componentCount)}
-                icon={<Layers className="w-4 h-4" />}
-              />
-              <StatTile
-                label="Mesh 數"
-                value={String(result.meshCount)}
-                icon={<Box className="w-4 h-4" />}
-              />
-              <StatTile
-                label="整體高度 dZ (mm)"
-                value={fmt(result.overall?.size?.[2])}
-                icon={<Ruler className="w-4 h-4" />}
-                accent
-              />
-              <StatTile
-                label="板面 X×Y (mm)"
-                value={`${fmt(result.overall?.size?.[0])} × ${fmt(result.overall?.size?.[1])}`}
+                label="板框 X×Y (mm)"
+                value={result.board ? `${fmt(result.board.width, 1)}×${fmt(result.board.depth, 1)}` : '—'}
                 icon={<Ruler className="w-4 h-4" />}
               />
+              <StatTile label="正面 / 背面" value={`${sideCounts.top} / ${sideCounts.bottom}`} icon={<Box className="w-4 h-4" />} />
             </section>
 
             <section className="border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-950 rounded-xl shadow-sm overflow-hidden">
-              <div className="px-4 py-3 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between">
-                <h2 className="text-base font-semibold flex items-center space-x-2">
+              <div className="px-4 py-3 border-b border-slate-200 dark:border-slate-800 flex flex-col sm:flex-row sm:items-center gap-3">
+                <h2 className="text-base font-semibold flex items-center space-x-2 shrink-0">
                   <Layers className="w-5 h-5 text-slate-500" />
-                  <span>零件清單（依高度排序）</span>
+                  <span>零件清單</span>
                 </h2>
-                <span className="text-xs text-slate-500 font-mono">{result.components.length} 件</span>
+                <div className="relative flex-1 max-w-xs">
+                  <Search className="w-4 h-4 absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400" />
+                  <input
+                    value={query}
+                    onChange={(e) => setQuery(e.target.value)}
+                    placeholder="搜尋 refdes / 封裝…"
+                    className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-transparent pl-8 pr-3 py-1.5 text-sm outline-none focus:ring-2 focus:ring-blue-500"
+                  />
+                </div>
+                <div className="flex items-center rounded-lg border border-slate-300 dark:border-slate-700 overflow-hidden text-sm">
+                  {(['all', 'top', 'bottom'] as const).map((s) => (
+                    <button
+                      key={s}
+                      onClick={() => setSide(s)}
+                      className={cn(
+                        'px-3 py-1.5 transition-colors cursor-pointer',
+                        side === s ? 'bg-blue-600 text-white' : 'text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800',
+                      )}
+                    >
+                      {s === 'all' ? '全部' : s === 'top' ? '正面' : '背面'}
+                    </button>
+                  ))}
+                </div>
+                <span className="text-xs text-slate-500 font-mono sm:ml-auto shrink-0">
+                  顯示 {Math.min(shown.length, filtered.length)} / {filtered.length}
+                </span>
               </div>
+
               <div className="overflow-x-auto">
                 <table className="w-full text-sm">
                   <thead>
                     <tr className="text-left text-xs font-semibold uppercase tracking-wider text-slate-500 border-b border-slate-200 dark:border-slate-800">
                       <th className="px-4 py-2">#</th>
-                      <th className="px-4 py-2">名稱</th>
-                      <th className="px-4 py-2 text-right">高度 dZ</th>
-                      <th className="px-4 py-2 text-right">dX</th>
-                      <th className="px-4 py-2 text-right">dY</th>
-                      <th className="px-4 py-2 text-right">Z 範圍 (min→max)</th>
-                      <th className="px-4 py-2 text-right">Mesh</th>
+                      <th className="px-4 py-2">ID / refdes</th>
+                      <th className="px-4 py-2">封裝</th>
+                      <th className="px-4 py-2 text-right">X</th>
+                      <th className="px-4 py-2 text-right">Y</th>
+                      <th className="px-4 py-2 text-right">高度 (mm)</th>
+                      <th className="px-4 py-2 text-center">面</th>
                     </tr>
                   </thead>
                   <tbody className="font-mono">
-                    {result.components.map((c, i) => (
+                    {shown.map((c, i) => (
                       <tr
                         key={i}
                         className="border-b border-slate-100 dark:border-slate-800/60 hover:bg-slate-50 dark:hover:bg-slate-900/40"
                       >
-                        <td className="px-4 py-2 text-slate-400">{i + 1}</td>
-                        <td className="px-4 py-2 font-sans">{c.name}</td>
-                        <td className="px-4 py-2 text-right font-semibold text-blue-600 dark:text-blue-400">
+                        <td className="px-4 py-1.5 text-slate-400">{i + 1}</td>
+                        <td className={cn('px-4 py-1.5 font-semibold', c.isRefdes ? 'text-blue-600 dark:text-blue-400' : 'text-slate-400')}>
+                          {c.id}
+                        </td>
+                        <td className="px-4 py-1.5 font-sans text-slate-600 dark:text-slate-300 max-w-xs truncate">{c.footprint}</td>
+                        <td className="px-4 py-1.5 text-right text-slate-500">{fmt(c.x, 1)}</td>
+                        <td className="px-4 py-1.5 text-right text-slate-500">{fmt(c.y, 1)}</td>
+                        <td className={cn('px-4 py-1.5 text-right font-semibold', c.height >= 3 ? 'text-amber-600 dark:text-amber-400' : '')}>
                           {fmt(c.height)}
                         </td>
-                        <td className="px-4 py-2 text-right text-slate-500">{fmt(c.size[0])}</td>
-                        <td className="px-4 py-2 text-right text-slate-500">{fmt(c.size[1])}</td>
-                        <td className="px-4 py-2 text-right text-slate-500">
-                          {fmt(c.bbox.min[2])} → {fmt(c.bbox.max[2])}
+                        <td className="px-4 py-1.5 text-center">
+                          <span
+                            className={cn(
+                              'inline-block rounded px-1.5 py-0.5 text-[11px] font-sans',
+                              c.side === 'top'
+                                ? 'bg-blue-50 text-blue-600 dark:bg-blue-900/20 dark:text-blue-400'
+                                : 'bg-amber-50 text-amber-600 dark:bg-amber-900/20 dark:text-amber-400',
+                            )}
+                          >
+                            {c.side === 'top' ? '正' : '背'}
+                          </span>
                         </td>
-                        <td className="px-4 py-2 text-right text-slate-400">{c.meshCount}</td>
                       </tr>
                     ))}
                   </tbody>
                 </table>
+              </div>
+              <div className="px-4 py-2 border-t border-slate-200 dark:border-slate-800 text-[11px] text-slate-400 flex items-center justify-between">
+                <span>高度取自 3D 模型方塊；部分零件為 0.15&quot;/3.81mm 預設值（庫未建真實高度）。</span>
+                <span className="font-mono">解析 {result.parseMs}ms</span>
               </div>
             </section>
           </>
@@ -253,9 +303,7 @@ function StatTile({
         {icon}
         <span>{label}</span>
       </div>
-      <div className={cn('mt-2 text-3xl font-mono font-bold', accent && 'text-blue-600 dark:text-blue-400')}>
-        {value}
-      </div>
+      <div className={cn('mt-2 text-3xl font-mono font-bold', accent && 'text-blue-600 dark:text-blue-400')}>{value}</div>
     </div>
   );
 }

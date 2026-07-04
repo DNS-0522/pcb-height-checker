@@ -1,0 +1,5 @@
+# Bot Limit tiles, NO flip (original text is readable). board approx x[450,745] y[450,602]
+bln_a.png  450 524 600 602 1456
+bln_b.png  595 524 745 602 1456
+bln_c.png  450 450 600 528 1456
+bln_d.png  595 450 745 528 1456

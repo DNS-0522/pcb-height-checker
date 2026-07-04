@@ -1,0 +1,5 @@
+# Bot Limit board tiles (2x2, overlap), flipx=1 to un-mirror text. board approx x[450,745] y[450,602]
+bl_a.png  450 524 600 602 1456 1
+bl_b.png  595 524 745 602 1456 1
+bl_c.png  450 450 600 528 1456 1
+bl_d.png  595 450 745 528 1456 1

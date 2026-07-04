@@ -3,7 +3,10 @@ import cors from 'cors';
 import { stpRouter } from './stp';
 
 const app = express();
-const PORT = process.env.PORT ? Number(process.env.PORT) : 3001;
+// Note: do NOT read process.env.PORT — the preview panel injects PORT=<client
+// port> into the whole `npm run dev` env, which would make the API collide with
+// the Vite client. Use a dedicated SERVER_PORT (defaults to 3001).
+const PORT = process.env.SERVER_PORT ? Number(process.env.SERVER_PORT) : 3001;
 
 app.use(cors());
 

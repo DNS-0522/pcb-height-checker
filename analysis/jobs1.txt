@@ -1,0 +1,4 @@
+# name x0 y0 x1 y1 pxwidth
+b_TOP_CONN.png   35 628 345 760 1456
+b_TOP_PAD.png    35 268 345 432 1456
+b_TOP_WHITE.png  35 116 345 236 1456

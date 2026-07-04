@@ -1,0 +1,5 @@
+# TOP Limit board tiles (2x2, overlap) -- board approx x[45,335] y[450,598]
+tl_TL.png  45 522 193 600 1456
+tl_TR.png  185 522 335 600 1456
+tl_BL.png  45 448 193 526 1456
+tl_BR.png  185 448 335 526 1456
