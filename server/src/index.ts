@@ -1,6 +1,8 @@
 import express from 'express';
 import cors from 'cors';
 import { stpRouter } from './stp';
+import { heightCheckRouter } from './heightcheck';
+import { analyzeRouter } from './analyze';
 
 const app = express();
 // Note: do NOT read process.env.PORT — the preview panel injects PORT=<client
@@ -9,12 +11,15 @@ const app = express();
 const PORT = process.env.SERVER_PORT ? Number(process.env.SERVER_PORT) : 3001;
 
 app.use(cors());
+app.use(express.json());
 
 app.get('/api/health', (_req, res) => {
   res.json({ ok: true, service: 'pcb-height-checker', ts: new Date().toISOString() });
 });
 
 app.use('/api/stp', stpRouter);
+app.use('/api/heightcheck', heightCheckRouter);
+app.use('/api/analyze', analyzeRouter);
 
 app.listen(PORT, () => {
   console.log(`[server] listening on http://localhost:${PORT}`);
