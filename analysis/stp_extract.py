@@ -12,7 +12,7 @@ from OCP.TDataStd import TDataStd_Name
 from OCP.Bnd import Bnd_Box
 from OCP.BRepBndLib import BRepBndLib
 
-PATH = r"F:\ux3607ya.10-3d_0616\0616_1839_top_and_bottom.stp"
+PATH = r"../samples/0616_1839_top_and_bottom.stp"
 
 doc = TDocStd_Document(TCollection_ExtendedString("d"))
 reader = STEPCAFControl_Reader()

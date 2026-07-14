@@ -15,3 +15,15 @@ Thumbs.db
 /samples/*.dxf
 /samples/*.DXF
 !/samples/README.md
+server/uploads/
+
+# analysis working artifacts (regenerable)
+analysis/__pycache__/
+analysis/renders/
+server/data/*/_*.jpg
+
+# board-derived datasets stay local (confidential design data);
+# only the font glyph templates are generic enough to version
+server/data/
+analysis/*.json
+!analysis/glyph_templates.json

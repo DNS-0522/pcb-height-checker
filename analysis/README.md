@@ -1,5 +1,25 @@
 # analysis/ — DXF×STP 探勘腳本（一次性）
 
+## 2026-07-12 更新：H 值 OCR 管線（視覺辨識版）已跑通
+真實 DXF 雖無 TEXT 實體，但 H= 標註是「短線段描邊字」，可幾何聚類出精確位置，
+再渲染小圖由視覺模型讀值 → flood-fill 關聯包圍區域。結果：
+
+| 檔 | 內容 |
+|---|---|
+| `hlabel_cluster.py` | 短線段聚類找 H= 標註候選（第一輪 MAX_SEG=4/GAP=1.2）|
+| `hlabel_crops_fast.py` | 視圖整張 rasterize 一次 + numpy 裁切 + contact sheet（讀值用）|
+| `text_cluster.py` | `*_DXF_TEXT` 圖層 POLYLINE 字元聚類（視圖標題）|
+| `glyph_match.py` | **A 方法:離線向量字形比對**(零 OCR/零網路)。`build`=從已確認標註建 10 字元模板;`evaluate`=148 標註驗證:**自動接受 123(83%)全對、25 旗標人工、0 安靜錯誤**。Chamfer 距離+16 方位+多重過濾自選+模糊度/截斷防護 |
+| `zone_extract.py` | 14px/mm rasterize → connected-components → 分層採樣關聯標註→區域 → `zones.json` |
+| `hlabel_values.json` | **150 個 H 標註**（view/座標/值），TOP{0,.5,.6,.7,.75,.85,1,1.2} BOT{0,.5,.8,1,1.2,2,2.5,3} |
+| `zones.json` | 149/150 關聯成功，137 區，**5 區有多值衝突**（標註跨界線/一矩形兩標註）已旗標 |
+| `renders/zones_*.png` | 分區上色 QA 疊圖（git-ignored，重跑 `py zone_extract.py` 產生）|
+
+教訓：聚類勿靜默丟棄超大群（密集標註會鏈接成大群，要遞迴細分）；大字體筆畫
+超過 MAX_SEG 上限會漏；標註可能成對出現在同一矩形內（H=0+H=0.7）需人工判讀。
+
+---
+
 2026-06-30 用真實樣本做的探勘與交叉驗證腳本。**這些是研究用一次性腳本，不是產品程式**；正式的 STP 解析在 `../server/src/step-parse.ts`。從 Power-budget-calculator 的暫存區搬來歸位。
 
 ## 輸入樣本
