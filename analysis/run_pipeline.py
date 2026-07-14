@@ -7,6 +7,8 @@ Sub-commands (all write into --out DIR):
   extract   --dxf F --views overview_views.json
                               labels (vector glyph match, offline) + zones + registration
                               + dataset {meta,zones,components,labels}.json
+  diff      --dxf A --dxf-b B render both revisions at identical extents and
+                              compose a pixel diff -> a/b/diff.jpg + diff.json
 
 Progress goes to stdout as lines "PROGRESS <percent> <message>" so the server
 can stream it. Requires: ezdxf, numpy, matplotlib, scikit-image, cadquery-ocp,
@@ -1037,6 +1039,254 @@ def cmd_register(args):
     json.dump(comps_out, open(os.path.join(out, 'components.json'), 'w', encoding='utf-8'))
     progress(100, f'register 完成:{len(comps_out)} 零件重新歸區')
 
+def cmd_diff(args):
+    """Revision diff: render two DXFs at identical extents/scale and compose a
+    pixel diff (gray = unchanged, red = only in A/old, green = only in B/new).
+    Writes a.jpg / b.jpg / diff.jpg + diff.json (extents, stats, change regions).
+    Assumes both revisions share the sheet coordinate system (same CAD export)."""
+    import ezdxf
+    import matplotlib; matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from ezdxf.addons.drawing import Frontend, RenderContext
+    from ezdxf.addons.drawing.matplotlib import MatplotlibBackend
+    from ezdxf.addons.drawing.config import Configuration, BackgroundPolicy, ColorPolicy
+    from skimage.morphology import binary_dilation
+    from skimage import measure
+    from PIL import Image
+
+    cfg = Configuration(background_policy=BackgroundPolicy.WHITE, color_policy=ColorPolicy.BLACK)
+    docs = []
+    for i, path in enumerate([args.dxf, args.dxf_b]):
+        progress(3 + i * 4, f'讀取{"舊版" if i == 0 else "新版"} DXF…')
+        docs.append(ezdxf.readfile(path))
+    xs, ys = [], []
+    for doc in docs:
+        for e in doc.modelspace():
+            if e.dxftype() == 'LINE':
+                xs += [e.dxf.start.x, e.dxf.end.x]; ys += [e.dxf.start.y, e.dxf.end.y]
+    if not xs:
+        print('ERROR 兩個 DXF 都沒有 LINE 實體,無法決定圖面範圍', flush=True)
+        sys.exit(2)
+    x0, x1 = min(xs), max(xs); y0, y1 = min(ys), max(ys)
+    pad = 0.01 * max(x1 - x0, y1 - y0)
+    x0 -= pad; y0 -= pad; x1 += pad; y1 += pad
+    SCALE = min(3.0, 4200 / (x1 - x0))
+    dpi = 100
+    walls = []
+    for i, doc in enumerate(docs):
+        progress(12 + i * 34, f'渲染{"舊版" if i == 0 else "新版"}…')
+        fig = plt.figure(figsize=((x1-x0)*SCALE/dpi, (y1-y0)*SCALE/dpi), dpi=dpi)
+        ax = fig.add_axes([0, 0, 1, 1]); ax.set_facecolor('white')
+        Frontend(RenderContext(doc), MatplotlibBackend(ax), config=cfg).draw_layout(
+            doc.modelspace(), finalize=False)
+        ax.set_xlim(x0, x1); ax.set_ylim(y0, y1); ax.set_aspect('equal'); ax.axis('off')
+        fig.canvas.draw()
+        buf = np.asarray(fig.canvas.buffer_rgba())[:, :, :3]
+        walls.append(buf.mean(axis=2) < 128)
+        Image.fromarray(buf.copy()).save(
+            os.path.join(args.out, f'{"ab"[i]}.jpg'), 'JPEG', quality=75)
+        plt.close(fig)
+    a, b = walls
+    progress(82, '計算像素差異…')
+    # 1px tolerance kills the anti-alias fringe of unchanged strokes
+    d3 = np.ones((3, 3), dtype=bool)
+    only_a = a & ~binary_dilation(b, footprint=d3)
+    only_b = b & ~binary_dilation(a, footprint=d3)
+    both = (a | b) & ~only_a & ~only_b
+    Hpx, Wpx = a.shape
+    img = np.full((Hpx, Wpx, 3), 255, np.uint8)
+    img[both] = (148, 155, 164)
+    img[only_a] = (225, 29, 72)
+    img[only_b] = (22, 163, 74)
+    Image.fromarray(img).save(os.path.join(args.out, 'diff.jpg'), 'JPEG', quality=80)
+    progress(90, '聚類差異區域…')
+    changed = only_a | only_b
+    merged = binary_dilation(changed, footprint=np.ones((9, 9)))   # merge nearby marks
+    lab = measure.label(merged, connectivity=2)
+    regions = []
+    for rp in measure.regionprops(lab):
+        r0, c0, r1, c1 = rp.bbox
+        na = int(only_a[r0:r1, c0:c1].sum()); nb = int(only_b[r0:r1, c0:c1].sum())
+        if na + nb < 30:
+            continue    # a few stray pixels, not a real change
+        regions.append({
+            'x0': round(x0 + c0 / SCALE, 2), 'y0': round(y0 + (Hpx - r1) / SCALE, 2),
+            'x1': round(x0 + c1 / SCALE, 2), 'y1': round(y0 + (Hpx - r0) / SCALE, 2),
+            'removedPx': na, 'addedPx': nb,
+        })
+    regions.sort(key=lambda r: -(r['removedPx'] + r['addedPx']))
+    json.dump({'x0': round(x0, 2), 'y0': round(y0, 2), 'x1': round(x1, 2), 'y1': round(y1, 2),
+               'pxw': Wpx, 'pxh': Hpx,
+               'removedPx': int(only_a.sum()), 'addedPx': int(only_b.sum()),
+               'regions': regions[:300], 'regionsTotal': len(regions)},
+              open(os.path.join(args.out, 'diff.json'), 'w'))
+    progress(100, f'比對完成:{len(regions)} 個差異區域')
+
+def cmd_carryover(args):
+    """DXF-replacement carry-over: diff the previous revision (--dxf-b) against
+    the new one (--dxf) inside each Limit view, then migrate the human work
+    from the prev dataset (prev_zones/prev_labels/prev_zone_overrides.json in
+    --out) onto the freshly-extracted dataset:
+      - zone overrides migrate onto IoU-matched zones NOT touched by any change;
+      - matched-but-changed zones become review suggestions (old value shown);
+      - manually-filled label values migrate onto position-matched flagged
+        labels in unchanged spots.
+    Writes zone_overrides.json / labels.json / carryover.json."""
+    import ezdxf
+    import matplotlib; matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from ezdxf.addons.drawing import Frontend, RenderContext
+    from ezdxf.addons.drawing.matplotlib import MatplotlibBackend
+    from ezdxf.addons.drawing.config import Configuration, BackgroundPolicy, ColorPolicy
+    from skimage.morphology import binary_dilation
+    from skimage.draw import polygon as sk_polygon
+
+    out = args.out
+    meta = json.load(open(os.path.join(out, 'meta.json'), encoding='utf-8'))
+    views = meta['views']
+    zones = json.load(open(os.path.join(out, 'zones.json'), encoding='utf-8'))
+    labels = json.load(open(os.path.join(out, 'labels.json'), encoding='utf-8'))
+    prev_zones = json.load(open(os.path.join(out, 'prev_zones.json'), encoding='utf-8'))
+    prev_labels = json.load(open(os.path.join(out, 'prev_labels.json'), encoding='utf-8'))
+    ov_path = os.path.join(out, 'prev_zone_overrides.json')
+    prev_over = json.load(open(ov_path, encoding='utf-8')) if os.path.exists(ov_path) else {}
+
+    SCALE = 14
+    cfg = Configuration(background_policy=BackgroundPolicy.WHITE, color_policy=ColorPolicy.BLACK)
+
+    def render_walls(doc, ctx, vb):
+        dpi = 100
+        fig = plt.figure(figsize=((vb[2]-vb[0])*SCALE/dpi, (vb[3]-vb[1])*SCALE/dpi), dpi=dpi)
+        ax = fig.add_axes([0, 0, 1, 1]); ax.set_facecolor('white')
+        Frontend(ctx, MatplotlibBackend(ax), config=cfg).draw_layout(doc.modelspace(), finalize=False)
+        ax.set_xlim(vb[0], vb[2]); ax.set_ylim(vb[1], vb[3]); ax.set_aspect('equal'); ax.axis('off')
+        fig.canvas.draw()
+        w = np.asarray(fig.canvas.buffer_rgba())[:, :, :3].mean(axis=2) < 128
+        plt.close(fig)
+        return w
+
+    def poly_iou(p1, p2):
+        pts1 = np.asarray(p1, float); pts2 = np.asarray(p2, float)
+        if len(pts1) < 3 or len(pts2) < 3:
+            return 0.0
+        S = 2.0
+        bx0 = min(pts1[:, 0].min(), pts2[:, 0].min()); bx1 = max(pts1[:, 0].max(), pts2[:, 0].max())
+        by0 = min(pts1[:, 1].min(), pts2[:, 1].min()); by1 = max(pts1[:, 1].max(), pts2[:, 1].max())
+        W = max(2, int((bx1-bx0)*S)+2); H = max(2, int((by1-by0)*S)+2)
+        masks = []
+        for pts in (pts1, pts2):
+            m = np.zeros((H, W), bool)
+            rr, cc = sk_polygon((pts[:, 1]-by0)*S, (pts[:, 0]-bx0)*S, (H, W))
+            m[rr, cc] = True
+            masks.append(m)
+        union = (masks[0] | masks[1]).sum()
+        return float((masks[0] & masks[1]).sum() / union) if union else 0.0
+
+    progress(5, '讀取新舊 DXF…')
+    doc_new = ezdxf.readfile(args.dxf)
+    doc_prev = ezdxf.readfile(args.dxf_b)
+    ctx_new = RenderContext(doc_new)
+    ctx_prev = RenderContext(doc_prev)
+
+    changed_zone_ids = set()
+    changed_masks = {}
+    for vi, (view, vb) in enumerate(views.items()):
+        progress(10 + vi*30, f'{view}:渲染新舊版並比對…')
+        w_new = render_walls(doc_new, ctx_new, vb)
+        w_prev = render_walls(doc_prev, ctx_prev, vb)
+        d3 = np.ones((3, 3), dtype=bool)
+        changed = (w_prev & ~binary_dilation(w_new, footprint=d3)) \
+                | (w_new & ~binary_dilation(w_prev, footprint=d3))
+        changed = binary_dilation(changed, footprint=np.ones((5, 5)))
+        changed_masks[view] = (changed, vb)
+        Hpx, Wpx = changed.shape
+        for z in zones:
+            if z['view'] != view or len(z.get('polygon') or []) < 3:
+                continue
+            pts = np.asarray(z['polygon'], float)
+            rr, cc = sk_polygon(
+                np.clip((Hpx - 1) - (pts[:, 1] - vb[1]) * SCALE, 0, Hpx - 1),
+                np.clip((pts[:, 0] - vb[0]) * SCALE, 0, Wpx - 1), (Hpx, Wpx))
+            if changed[rr, cc].sum() >= 20:
+                changed_zone_ids.add(z['id'])
+
+    def centroid(poly):
+        pts = np.asarray(poly, float)
+        return pts[:, 0].mean(), pts[:, 1].mean()
+
+    progress(72, '配對新舊區域…')
+    new_over, migrated, review = {}, [], []
+    prev_by_view = {}
+    for pz in prev_zones:
+        if len(pz.get('polygon') or []) >= 3:
+            prev_by_view.setdefault(pz['view'], []).append(pz)
+    for z in zones:
+        if len(z.get('polygon') or []) < 3:
+            continue
+        zc = centroid(z['polygon'])
+        best, best_iou = None, 0.0
+        for pz in prev_by_view.get(z['view'], []):
+            pc = centroid(pz['polygon'])
+            if abs(pc[0]-zc[0]) > 25 or abs(pc[1]-zc[1]) > 25:
+                continue
+            if pz.get('areaMm2') and z.get('areaMm2'):
+                ratio = pz['areaMm2'] / z['areaMm2']
+                if ratio < 0.4 or ratio > 2.5:
+                    continue
+            iou = poly_iou(z['polygon'], pz['polygon'])
+            if iou > best_iou:
+                best, best_iou = pz, iou
+        if best is None or best_iou < 0.7 or best['id'] not in prev_over:
+            continue
+        val = prev_over[best['id']]
+        if z['id'] in changed_zone_ids:
+            review.append({'zoneId': z['id'], 'oldValue': val})
+        else:
+            new_over[z['id']] = val
+            migrated.append({'zoneId': z['id'], 'value': val})
+
+    progress(85, '搬移人工標註值…')
+    def is_manual(pl):
+        """A prev-label value counts as human-entered unless it is exactly what
+        the auto reader produced (clean read H=<value> with a passing score)."""
+        if pl.get('value') is None:
+            return False
+        r = str(pl.get('read', ''))
+        if pl.get('score', 1) <= 0.12 and r.startswith('H='):
+            try:
+                return float(r[2:]) != pl['value']
+            except ValueError:
+                return True
+        return True
+
+    carried = []
+    for l in labels:
+        if not l.get('flagged'):
+            continue
+        changed, vb = changed_masks.get(l['view'], (None, None))
+        if changed is None:
+            continue
+        Hpx, Wpx = changed.shape
+        c0 = max(0, int((l['x0'] - 1 - vb[0]) * SCALE)); c1 = min(Wpx, int((l['x1'] + 1 - vb[0]) * SCALE))
+        r0 = max(0, int((Hpx - 1) - (l['y1'] + 1 - vb[1]) * SCALE)); r1 = min(Hpx, int((Hpx - 1) - (l['y0'] - 1 - vb[1]) * SCALE))
+        if c1 <= c0 or r1 <= r0 or changed[r0:r1, c0:c1].any():
+            continue    # the spot changed between revisions: needs fresh judgement
+        for pl in prev_labels:
+            if (pl['view'] == l['view'] and is_manual(pl)
+                    and abs(pl['cx'] - l['cx']) < 3 and abs(pl['cy'] - l['cy']) < 3):
+                l['value'] = pl['value']
+                l['flagged'] = False
+                l['carried'] = True
+                carried.append(l['id'])
+                break
+
+    json.dump(new_over, open(os.path.join(out, 'zone_overrides.json'), 'w'))
+    json.dump(labels, open(os.path.join(out, 'labels.json'), 'w', encoding='utf-8'))
+    json.dump({'migrated': migrated, 'review': review, 'carriedLabels': carried,
+               'changedZones': sorted(changed_zone_ids)},
+              open(os.path.join(out, 'carryover.json'), 'w'))
+    progress(100, f'沿用 {len(migrated)} 區、{len(carried)} 標註;{len(review)} 區有變更待重新確認')
+
 def cmd_debugviz(args):
     """Backfill zone-cutting debug artifacts for an existing dataset."""
     import ezdxf
@@ -1087,14 +1337,14 @@ def cmd_debugviz(args):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('cmd', choices=['overview', 'stp', 'extract', 'alignment', 'register', 'debugviz'])
-    ap.add_argument('--dxf'); ap.add_argument('--stp')
+    ap.add_argument('cmd', choices=['overview', 'stp', 'extract', 'alignment', 'register', 'debugviz', 'diff', 'carryover'])
+    ap.add_argument('--dxf'); ap.add_argument('--dxf-b'); ap.add_argument('--stp')
     ap.add_argument('--views'); ap.add_argument('--out', required=True)
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
     {'overview': cmd_overview, 'stp': cmd_stp, 'extract': cmd_extract,
      'alignment': cmd_alignment, 'register': cmd_register,
-     'debugviz': cmd_debugviz}[args.cmd](args)
+     'debugviz': cmd_debugviz, 'diff': cmd_diff, 'carryover': cmd_carryover}[args.cmd](args)
 
 if __name__ == '__main__':
     main()

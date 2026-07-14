@@ -3,6 +3,7 @@ import cors from 'cors';
 import { stpRouter } from './stp';
 import { heightCheckRouter } from './heightcheck';
 import { analyzeRouter } from './analyze';
+import { dxfDiffRouter } from './dxfdiff';
 
 const app = express();
 // Note: do NOT read process.env.PORT — the preview panel injects PORT=<client
@@ -20,6 +21,7 @@ app.get('/api/health', (_req, res) => {
 app.use('/api/stp', stpRouter);
 app.use('/api/heightcheck', heightCheckRouter);
 app.use('/api/analyze', analyzeRouter);
+app.use('/api/dxfdiff', dxfDiffRouter);
 
 app.listen(PORT, () => {
   console.log(`[server] listening on http://localhost:${PORT}`);

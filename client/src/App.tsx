@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react';
-import { CircuitBoard, Sun, Moon } from 'lucide-react';
+import { CircuitBoard, Sun, Moon, Ruler, GitCompareArrows } from 'lucide-react';
+import { cn } from './lib/utils';
 import HeightCheck from './HeightCheck';
+import DxfDiff from './DxfDiff';
 
 function useTheme() {
   const [dark, setDark] = useState(() => localStorage.getItem('theme') === 'dark');
@@ -17,8 +19,20 @@ function useTheme() {
   return { dark, toggle: () => setDark((d) => !d) };
 }
 
+type Page = 'check' | 'diff';
+
+const PAGES: { id: Page; label: string; Icon: typeof Ruler }[] = [
+  { id: 'check', label: '限高檢查', Icon: Ruler },
+  { id: 'diff', label: 'DXF 比對', Icon: GitCompareArrows },
+];
+
 export default function App() {
   const { dark, toggle } = useTheme();
+  const [page, setPage] = useState<Page>(() =>
+    localStorage.getItem('page') === 'diff' ? 'diff' : 'check');
+  useEffect(() => {
+    localStorage.setItem('page', page);
+  }, [page]);
 
   return (
     <div className="min-h-screen bg-slate-50 dark:bg-slate-900 text-slate-900 dark:text-slate-100 transition-colors duration-200">
@@ -39,10 +53,30 @@ export default function App() {
             {dark ? <Sun className="w-5 h-5" /> : <Moon className="w-5 h-5" />}
           </button>
         </div>
+        <nav className="px-4 sm:px-6 lg:px-8 flex space-x-1 border-t border-slate-100 dark:border-slate-800/60">
+          {PAGES.map(({ id, label, Icon }) => (
+            <button
+              key={id}
+              onClick={() => setPage(id)}
+              className={cn(
+                'flex items-center space-x-2 px-3 py-2.5 text-sm font-medium border-b-2 -mb-px transition-colors cursor-pointer',
+                page === id
+                  ? 'text-blue-600 dark:text-blue-400 border-blue-500'
+                  : 'text-slate-500 hover:text-slate-700 dark:hover:text-slate-300 border-transparent',
+              )}
+            >
+              <Icon className="w-4 h-4" />
+              <span>{label}</span>
+            </button>
+          ))}
+        </nav>
       </header>
 
       <main className="px-4 sm:px-6 lg:px-8 py-8 space-y-8">
-        <HeightCheck />
+        {/* both pages stay mounted so tab switches keep state (selected board,
+            rules, in-flight upload polling) */}
+        <div className={cn(page !== 'check' && 'hidden')}><HeightCheck /></div>
+        <div className={cn(page !== 'diff' && 'hidden')}><DxfDiff /></div>
       </main>
     </div>
   );

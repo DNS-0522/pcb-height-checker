@@ -9,6 +9,7 @@ import {
   Info,
   FileUp,
   PenLine,
+  RefreshCw,
 } from 'lucide-react';
 import { cn, fmt } from './lib/utils';
 import UploadWizard from './UploadWizard';
@@ -101,7 +102,15 @@ interface BoardInfo {
   source: 'builtin' | 'upload';
 }
 
-const ROW_CAP = 300;
+/** replace-dxf 的沿用報告(carryover.json) */
+interface Carryover {
+  migrated: { zoneId: string; value: number | 'nolimit' }[];
+  review: { zoneId: string; oldValue: number | 'nolimit' }[];
+  carriedLabels: string[];
+  changedZones: string[];
+}
+
+const PAGE_SIZE = 100;
 
 const STATUS_META: Record<Status, { label: string; color: string; chip: string }> = {
   violation: { label: '超高違規', color: '#dc2626', chip: 'bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300' },
@@ -127,6 +136,8 @@ export default function HeightCheck() {
   const [boards, setBoards] = useState<BoardInfo[]>([]);
   const [boardId, setBoardId] = useState<string | null>(null);
   const [showWizard, setShowWizard] = useState(false);
+  const [replaceTarget, setReplaceTarget] = useState<{ mode: 'stp' | 'dxf'; id: string; title: string } | null>(null);
+  const [carryover, setCarryover] = useState<Carryover | null>(null);
   const [meta, setMeta] = useState<Meta | null>(null);
   const [zones, setZones] = useState<Zone[]>([]);
   const [labels, setLabels] = useState<HLabel[]>([]);
@@ -145,17 +156,27 @@ export default function HeightCheck() {
     () => new Set<Status>(['violation', 'keepout', 'ok', 'no_limit', 'placeholder']),
   );
   const [query, setQuery] = useState('');
+  const [tableStatus, setTableStatus] = useState<'all' | Status>('all');
+  const [page, setPage] = useState(0);
   const [selected, setSelected] = useState<string | null>(null);
   const [hover, setHover] = useState<{ x: number; y: number; lines: string[] } | null>(null);
   const [showBackdrop, setShowBackdrop] = useState(true);
   const [showAlign, setShowAlign] = useState(true);
   const [focusLabel, setFocusLabel] = useState<string | null>(null);
+  const [locateZone, setLocateZone] = useState<Zone | null>(null);
   const boardRef = useRef<HTMLElement | null>(null);
   const [mode, setMode] = useState<'result' | 'debug'>('result');
   const [debugBase, setDebugBase] = useState<'draw' | 'walls' | 'cc'>('cc');
   const [debugZones, setDebugZones] = useState<Record<string, { id: string; areaMm2: number; polygon: [number, number][] }[]>>({});
   const [debugLabel, setDebugLabel] = useState<string | null>(null);
   const [debugOutlines, setDebugOutlines] = useState(true);
+
+  useEffect(() => {
+    if (!locateZone) return;
+    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && setLocateZone(null);
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [locateZone]);
 
   const refreshBoards = useCallback(async (): Promise<BoardInfo[]> => {
     const res = await fetch('/api/heightcheck/boards');
@@ -177,6 +198,7 @@ export default function HeightCheck() {
     setMeta(data.meta);
     setZones(data.zones);
     setLabels(data.labels ?? []);
+    setCarryover(data.carryover ?? null);
   }, []);
 
   useEffect(() => {
@@ -237,7 +259,7 @@ export default function HeightCheck() {
   const listed = useMemo(() => {
     const q = query.trim().toLowerCase();
     return (run?.results ?? [])
-      .filter((r) => statusFilter.has(r.status))
+      .filter((r) => tableStatus === 'all' || r.status === tableStatus)
       .filter((r) => !q || r.id.toLowerCase().includes(q) || r.footprint.toLowerCase().includes(q))
       .sort((a, b) => {
         const ov = (r: ResultComponent) => (r.allowed !== null && r.allowed > 0 ? r.h - r.allowed : -999);
@@ -245,7 +267,11 @@ export default function HeightCheck() {
         if (b.status === 'violation' && a.status !== 'violation') return 1;
         return ov(b) - ov(a);
       });
-  }, [run, statusFilter, query]);
+  }, [run, tableStatus, query]);
+
+  useEffect(() => {
+    setPage(0);
+  }, [tableStatus, query, boardId]);
 
   const ready = !!(meta && run);
   const vb = meta?.views[view] ?? [0, 0, 1, 1];
@@ -282,19 +308,43 @@ export default function HeightCheck() {
           </select>
         </label>
         <button
-          onClick={() => setShowWizard((s) => !s)}
+          onClick={() => { setReplaceTarget(null); setShowWizard((s) => !s || !!replaceTarget); }}
           className="px-4 py-1.5 rounded-lg border border-blue-500 text-blue-600 dark:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20 text-sm font-medium flex items-center space-x-2 cursor-pointer"
         >
           <FileUp className="w-4 h-4" />
           <span>上傳新板卡</span>
         </button>
+        {boards.find((b) => b.id === boardId)?.source === 'upload' && (
+          <>
+            {([['stp', '更換 STP', '沿用此板卡的 DXF 標註成果,只更換 3D 模型'],
+               ['dxf', '更換 DXF', '沿用 STP 與未變區域的人工判定,只更換圖面']] as const).map(([mode, label, title]) => (
+              <button
+                key={mode}
+                onClick={() => {
+                  const cur = boards.find((b) => b.id === boardId)!;
+                  const same = showWizard && replaceTarget?.mode === mode && replaceTarget.id === cur.id;
+                  setReplaceTarget(same ? null : { mode, id: cur.id, title: cur.title });
+                  setShowWizard(!same);
+                }}
+                className="px-4 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:border-blue-500 hover:text-blue-600 dark:hover:text-blue-400 text-sm font-medium flex items-center space-x-2 cursor-pointer"
+                title={title}
+              >
+                <RefreshCw className="w-4 h-4" />
+                <span>{label}</span>
+              </button>
+            ))}
+          </>
+        )}
       </section>
 
       {showWizard && (
         <UploadWizard
-          onClose={() => setShowWizard(false)}
+          key={replaceTarget ? `${replaceTarget.mode}-${replaceTarget.id}` : 'new'}
+          replace={replaceTarget}
+          onClose={() => { setShowWizard(false); setReplaceTarget(null); }}
           onDone={async (id) => {
             setShowWizard(false);
+            setReplaceTarget(null);
             await refreshBoards();
             setBoardId(id);
           }}
@@ -315,6 +365,20 @@ export default function HeightCheck() {
       )}
 
       {meta && run && (<>
+      {/* replace-dxf migration report */}
+      {carryover && (
+        <section className="rounded-xl border border-blue-200 dark:border-blue-900/50 bg-blue-50 dark:bg-blue-900/15 px-4 py-2.5 text-sm text-slate-600 dark:text-slate-300 flex items-start space-x-2">
+          <Info className="w-4 h-4 mt-0.5 shrink-0 text-blue-500" />
+          <span>
+            更換 DXF:已沿用上一版 {carryover.migrated.length} 個區域判定、
+            {carryover.carriedLabels.length} 個手填標註;
+            {carryover.review.length > 0
+              ? `${carryover.review.length} 個區域因圖面變更需重新確認(卡片附上一版的值)。`
+              : '圖面變更未影響任何已判定的區域。'}
+          </span>
+        </section>
+      )}
+
       {/* review queue: every numbered zone that still has no H value */}
       {pendingZones.length > 0 && (
         <section className="border border-amber-300 dark:border-amber-800 bg-white dark:bg-slate-950 rounded-xl p-4 shadow-sm">
@@ -335,12 +399,9 @@ export default function HeightCheck() {
                 focused={focusLabel === z.id}
                 outline={meta.registration[z.view]?.dxfBoardOutline}
                 viewBox={meta.views[z.view]}
+                suggest={carryover?.review.find((r) => r.zoneId === z.id)?.oldValue}
                 onSave={saveZone}
-                onLocate={() => {
-                  setView(z.view);
-                  setFocusLabel(z.id === focusLabel ? null : z.id);
-                  boardRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                }}
+                onLocate={() => setLocateZone(z)}
               />
             ))}
           </div>
@@ -842,8 +903,18 @@ export default function HeightCheck() {
               className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-transparent pl-8 pr-3 py-1.5 text-sm outline-none focus:ring-2 focus:ring-blue-500"
             />
           </div>
+          <select
+            value={tableStatus}
+            onChange={(e) => setTableStatus(e.target.value as 'all' | Status)}
+            className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-2 py-1.5 text-sm outline-none focus:ring-2 focus:ring-blue-500"
+          >
+            <option value="all">全部判定</option>
+            {(Object.keys(STATUS_META) as Status[]).map((s) => (
+              <option key={s} value={s}>{STATUS_META[s].label}</option>
+            ))}
+          </select>
           <span className="text-xs text-slate-500 font-mono sm:ml-auto shrink-0">
-            顯示 {Math.min(listed.length, ROW_CAP)} / {listed.length}(依上方卡片篩選)
+            {listed.length} 筆
           </span>
         </div>
         <div className="overflow-x-auto">
@@ -860,7 +931,7 @@ export default function HeightCheck() {
               </tr>
             </thead>
             <tbody className="font-mono">
-              {listed.slice(0, ROW_CAP).map((r) => {
+              {listed.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE).map((r) => {
                 const over = r.allowed !== null && r.allowed > 0 ? r.h - r.allowed : null;
                 return (
                   <tr
@@ -904,8 +975,101 @@ export default function HeightCheck() {
             </tbody>
           </table>
         </div>
+        {listed.length > PAGE_SIZE && (
+          <div className="px-4 py-2 border-t border-slate-200 dark:border-slate-800 flex items-center justify-between text-sm">
+            <button
+              onClick={() => setPage((p) => Math.max(0, p - 1))}
+              disabled={page === 0}
+              className="px-3 py-1 rounded-lg border border-slate-300 dark:border-slate-700 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed hover:border-blue-500"
+            >
+              ← 上一頁
+            </button>
+            <span className="text-xs text-slate-500 font-mono">
+              第 {page + 1} / {Math.ceil(listed.length / PAGE_SIZE)} 頁
+              (第 {page * PAGE_SIZE + 1}–{Math.min((page + 1) * PAGE_SIZE, listed.length)} 筆,共 {listed.length} 筆)
+            </span>
+            <button
+              onClick={() => setPage((p) => Math.min(Math.ceil(listed.length / PAGE_SIZE) - 1, p + 1))}
+              disabled={(page + 1) * PAGE_SIZE >= listed.length}
+              className="px-3 py-1 rounded-lg border border-slate-300 dark:border-slate-700 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed hover:border-blue-500"
+            >
+              下一頁 →
+            </button>
+          </div>
+        )}
       </section>
       </>)}
+
+      {locateZone && meta && (
+        <div
+          className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4"
+          onClick={() => setLocateZone(null)}
+        >
+          <div
+            className="bg-white dark:bg-slate-950 rounded-xl shadow-2xl max-w-4xl w-full p-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between mb-2">
+              <h4 className="text-sm font-semibold">
+                <span className="text-amber-600 dark:text-amber-400 font-bold">{locateZone.num}</span>
+                <span className="text-slate-500 font-normal">
+                  {' '}· {locateZone.view === 'TOP_LIMIT' ? '頂面 TOP' : '底面 BOT'} · {fmt(locateZone.areaMm2 ?? undefined, 0)} mm²
+                </span>
+              </h4>
+              <button
+                onClick={() => setLocateZone(null)}
+                className="px-2.5 py-1 rounded-lg text-sm text-slate-500 border border-slate-300 dark:border-slate-700 hover:border-blue-500 cursor-pointer"
+              >
+                關閉(Esc)
+              </button>
+            </div>
+            {(() => {
+              const vb2 = meta.views[locateZone.view];
+              return (
+                <svg
+                  viewBox={`${vb2[0]} ${-vb2[3]} ${vb2[2] - vb2[0]} ${vb2[3] - vb2[1]}`}
+                  className="w-full h-auto bg-white dark:bg-slate-900 rounded-lg"
+                >
+                  {boardId && (
+                    <image
+                      href={`/api/heightcheck/viewimg/${boardId}/${locateZone.view}`}
+                      x={vb2[0]}
+                      y={-vb2[3]}
+                      width={vb2[2] - vb2[0]}
+                      height={vb2[3] - vb2[1]}
+                      opacity={0.5}
+                      preserveAspectRatio="none"
+                    />
+                  )}
+                  {zones
+                    .filter((z) => z.view === locateZone.view && z.value !== null)
+                    .map((z) => (
+                      <polygon
+                        key={z.id}
+                        points={z.polygon.map(([x, y]) => `${x},${-y}`).join(' ')}
+                        fill={zoneColor(z.value!)}
+                        fillOpacity={0.18}
+                        stroke="none"
+                      />
+                    ))}
+                  <polygon
+                    points={locateZone.polygon.map(([x, y]) => `${x},${-y}`).join(' ')}
+                    fill="#f59e0b"
+                    fillOpacity={0.45}
+                    stroke="#d97706"
+                    strokeWidth={1.2}
+                  >
+                    <animate attributeName="fill-opacity" values="0.45;0.15;0.45" dur="1.4s" repeatCount="indefinite" />
+                  </polygon>
+                </svg>
+              );
+            })()}
+            <p className="mt-2 text-xs text-slate-400">
+              琥珀色閃爍 = 這張卡的區;其他有值區以淡色顯示供對照。
+            </p>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -916,6 +1080,7 @@ function PendingZoneCard({
   focused,
   outline,
   viewBox,
+  suggest,
   onSave,
   onLocate,
 }: {
@@ -924,6 +1089,8 @@ function PendingZoneCard({
   focused: boolean;
   outline?: [number, number][];
   viewBox?: [number, number, number, number];
+  /** replace-dxf:此區上一版的判定值(圖面有變,套用前請確認) */
+  suggest?: number | 'nolimit';
   onSave: (zoneId: string, value: number | 'nolimit' | null) => Promise<void> | void;
   onLocate: () => void;
 }) {
@@ -1038,6 +1205,20 @@ function PendingZoneCard({
         >
           無限制
         </button>
+        {suggest !== undefined && (
+          <button
+            disabled={saving}
+            onClick={async () => {
+              setSaving(true);
+              await onSave(zone.id, suggest);
+              setSaving(false);
+            }}
+            title="此區圖面有變更;確認限高沒改再套用"
+            className="px-2.5 py-1 border border-blue-300 dark:border-blue-800 text-blue-600 dark:text-blue-400 rounded text-xs cursor-pointer hover:bg-blue-50 dark:hover:bg-blue-900/20 disabled:opacity-50"
+          >
+            套用上一版:{suggest === 'nolimit' ? '無限制' : suggest}
+          </button>
+        )}
       </div>
     </div>
   );

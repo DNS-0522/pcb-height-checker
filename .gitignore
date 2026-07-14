@@ -16,6 +16,7 @@ Thumbs.db
 /samples/*.DXF
 !/samples/README.md
 server/uploads/
+server/diffs/
 
 # analysis working artifacts (regenerable)
 analysis/__pycache__/

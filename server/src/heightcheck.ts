@@ -165,6 +165,9 @@ heightCheckRouter.get('/boards', (_req, res) => {
     for (const id of readdirSync(base)) {
       const metaPath = join(base, id, 'meta.json');
       if (!existsSync(metaPath)) continue;
+      // replace-stp copies meta.json up front; the dataset is loadable only
+      // once components.json lands — hide it until then
+      if (!existsSync(join(base, id, 'components.json'))) continue;
       try {
         const meta = JSON.parse(readFileSync(metaPath, 'utf-8'));
         out.push({ id, title: meta.title ?? id, source });
@@ -177,8 +180,15 @@ heightCheckRouter.get('/boards', (_req, res) => {
 // Board dataset for rendering: zones (polygons + H values), labels, metadata.
 heightCheckRouter.get('/dataset/:boardId', (req, res) => {
   try {
-    const { meta, zones, labels } = loadBoard(req.params.boardId);
-    res.json({ meta, zones, labels });
+    const { dir, meta, zones, labels } = loadBoard(req.params.boardId);
+    // replace-dxf boards carry a migration report (what was carried over /
+    // which zones changed and need fresh judgement)
+    let carryover: unknown;
+    const co = join(dir, 'carryover.json');
+    if (existsSync(co)) {
+      try { carryover = JSON.parse(readFileSync(co, 'utf-8')); } catch { /* ignore */ }
+    }
+    res.json({ meta, zones, labels, carryover });
   } catch {
     res.status(404).json({ error: `Unknown board dataset: ${req.params.boardId}` });
   }

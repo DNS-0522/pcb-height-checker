@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { FileUp, Loader2, AlertTriangle, Crop, Play, X } from 'lucide-react';
 import { cn } from './lib/utils';
 
@@ -6,11 +6,13 @@ type View = 'TOP_LIMIT' | 'BOT_LIMIT';
 
 interface JobStatus {
   id: string;
-  phase: 'preparing' | 'awaiting-views' | 'extracting' | 'done' | 'error';
+  phase: 'preparing' | 'awaiting-views' | 'extracting' | 'registering' | 'migrating' | 'done' | 'error';
   progress: Record<string, number>;
   message: string;
   error?: string;
   overviewReady: boolean;
+  /** replace-dxf: previous revision's view boxes (mm) for framing prefill */
+  prevViews?: Partial<Record<View, [number, number, number, number]>>;
   log: string[];
 }
 
@@ -37,10 +39,15 @@ function toDxfBox(
 export default function UploadWizard({
   onDone,
   onClose,
+  replace,
 }: {
   onDone: (boardId: string) => void;
   onClose: () => void;
+  /** 更換模式:'stp' = 只換 3D 模型(保留 DXF 成果);'dxf' = 只換圖面(沿用 STP 與未變區的人工判定) */
+  replace?: { mode: 'stp' | 'dxf'; id: string; title: string } | null;
 }) {
+  const repStp = replace?.mode === 'stp';
+  const repDxf = replace?.mode === 'dxf';
   const [dxf, setDxf] = useState<File | null>(null);
   const [stp, setStp] = useState<File | null>(null);
   const [jobId, setJobId] = useState<string | null>(null);
@@ -56,13 +63,16 @@ export default function UploadWizard({
   const imgRef = useRef<HTMLImageElement>(null);
 
   async function start() {
-    if (!dxf || !stp) return;
+    if (repStp ? !stp : repDxf ? !dxf : (!dxf || !stp)) return;
     setUploading(true); setError(null);
     try {
       const fd = new FormData();
-      fd.append('dxf', dxf);
-      fd.append('stp', stp);
-      const res = await fetch('/api/analyze', { method: 'POST', body: fd });
+      if (!repDxf) fd.append('stp', stp!);
+      if (!repStp) fd.append('dxf', dxf!);
+      if (replace) fd.append('sourceBoardId', replace.id);
+      const url = repStp ? '/api/analyze/replace-stp'
+        : repDxf ? '/api/analyze/replace-dxf' : '/api/analyze';
+      const res = await fetch(url, { method: 'POST', body: fd });
       const data = await res.json();
       if (!res.ok) throw new Error(data?.error || `HTTP ${res.status}`);
       setJobId(data.jobId);
@@ -117,6 +127,25 @@ export default function UploadWizard({
     }
   }
 
+  // replace-dxf:把上一版的視圖框(mm)換算成顯示座標預填,確認即可
+  const [prefilled, setPrefilled] = useState(false);
+  const prefill = useCallback(() => {
+    const pv = status?.prevViews;
+    const img = imgRef.current;
+    if (prefilled || !repDxf || !extents || !pv?.TOP_LIMIT || !pv?.BOT_LIMIT || !img?.clientWidth) return;
+    const sx = img.clientWidth / (extents.x1 - extents.x0);
+    const sy = img.clientHeight / (extents.y1 - extents.y0);
+    const toPx = (b: [number, number, number, number]) => ({
+      x: (b[0] - extents.x0) * sx,
+      y: (extents.y1 - b[3]) * sy,
+      w: (b[2] - b[0]) * sx,
+      h: (b[3] - b[1]) * sy,
+    });
+    setRects({ TOP_LIMIT: toPx(pv.TOP_LIMIT), BOT_LIMIT: toPx(pv.BOT_LIMIT) });
+    setPrefilled(true);
+  }, [prefilled, repDxf, extents, status?.prevViews]);
+  useEffect(() => { prefill(); }, [prefill, status?.phase]);
+
   const framing = status?.phase === 'awaiting-views' && extents;
 
   return (
@@ -124,7 +153,13 @@ export default function UploadWizard({
       <div className="flex items-center justify-between">
         <h3 className="text-sm font-semibold flex items-center space-x-2">
           <FileUp className="w-4 h-4 text-blue-500" />
-          <span>上傳新板卡(DXF + STP)</span>
+          <span>
+            {repStp
+              ? `更換 STP:${replace!.title}(保留 DXF 標註成果)`
+              : repDxf
+                ? `更換 DXF:${replace!.title}(沿用 STP 與人工判定)`
+                : '上傳新板卡(DXF + STP)'}
+          </span>
         </h3>
         <button onClick={onClose} className="p-1 text-slate-400 hover:text-slate-600 cursor-pointer" aria-label="關閉">
           <X className="w-4 h-4" />
@@ -133,11 +168,11 @@ export default function UploadWizard({
 
       {!jobId && (
         <div className="flex flex-col sm:flex-row sm:items-center gap-3">
-          <FilePick label="DXF(2D 圖面)" accept=".dxf" file={dxf} onPick={setDxf} />
-          <FilePick label="STP(3D 模型)" accept=".stp,.step" file={stp} onPick={setStp} />
+          {!repStp && <FilePick label={repDxf ? '新版 DXF(2D 圖面)' : 'DXF(2D 圖面)'} accept=".dxf" file={dxf} onPick={setDxf} />}
+          {!repDxf && <FilePick label={repStp ? '新 STP(3D 模型)' : 'STP(3D 模型)'} accept=".stp,.step" file={stp} onPick={setStp} />}
           <button
             onClick={start}
-            disabled={!dxf || !stp || uploading}
+            disabled={(repStp ? !stp : repDxf ? !dxf : (!dxf || !stp)) || uploading}
             className="sm:ml-auto px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg flex items-center space-x-2 text-sm font-medium cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
           >
             {uploading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
@@ -163,7 +198,16 @@ export default function UploadWizard({
           </div>
           {status.phase === 'preparing' && (
             <p className="text-xs text-slate-400">
-              STP 世界座標解算需要數分鐘(OpenCASCADE)。縮覽圖好了就可以先框視圖,兩者平行進行。
+              {repStp
+                ? 'STP 世界座標解算需要數分鐘(OpenCASCADE),完成後會自動重新對位;DXF 標註與已填的 H 值全部保留,不需重新框視圖。'
+                : repDxf
+                  ? '正在渲染新版縮覽;完成後會出現預填好的視圖框,確認或微調即可。'
+                  : 'STP 世界座標解算需要數分鐘(OpenCASCADE)。縮覽圖好了就可以先框視圖,兩者平行進行。'}
+            </p>
+          )}
+          {status.phase === 'migrating' && (
+            <p className="text-xs text-slate-400">
+              正在比對新舊圖面差異:沒變的區域自動沿用上一版判定,有變的區域會進待確認清單。
             </p>
           )}
         </div>
@@ -173,7 +217,11 @@ export default function UploadWizard({
         <div className="space-y-3">
           <div className="flex flex-wrap items-center gap-3 text-sm">
             <Crop className="w-4 h-4 text-slate-500" />
-            <span>在縮覽圖上拖曳框出兩個 Limit 視圖:</span>
+            <span>
+              {repDxf && prefilled
+                ? '已預填上一版的視圖框,直接確認或重新拖曳調整:'
+                : '在縮覽圖上拖曳框出兩個 Limit 視圖:'}
+            </span>
             {(['TOP_LIMIT', 'BOT_LIMIT'] as View[]).map((v) => (
               <button
                 key={v}
@@ -230,6 +278,7 @@ export default function UploadWizard({
               alt="DXF 縮覽"
               className="w-full h-auto cursor-crosshair"
               draggable={false}
+              onLoad={prefill}
             />
             {(Object.entries(rects) as [View, { x: number; y: number; w: number; h: number }][]).map(([v, r]) => (
               <div
@@ -276,7 +325,7 @@ export default function UploadWizard({
   );
 }
 
-function FilePick({
+export function FilePick({
   label, accept, file, onPick,
 }: {
   label: string; accept: string; file: File | null; onPick: (f: File | null) => void;
