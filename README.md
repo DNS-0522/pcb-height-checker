@@ -26,10 +26,18 @@ samples/  Drop sample .dxf / .stp files here for development (git-ignored)
 
 ## Develop
 
+Prerequisites: Node 20+, **Python 3.12+ with the Windows `py` launcher**
+(`winget install Python.Python.3.12`, or python.org installer with
+"py launcher" checked). Python is a runtime requirement — the server spawns
+the analysis pipeline through `py`.
+
 ```bash
-npm install          # installs both workspaces
+npm run setup        # npm install (both workspaces) + Python pipeline deps
 npm run dev          # runs client (5173) + server (3001) together
 ```
+
+> `npm install` alone does NOT install the Python libraries. Standalone:
+> `py -m pip install -r analysis/requirements.txt`.
 
 - Frontend: http://localhost:5173 (proxies `/api/*` to the backend)
 - Backend health check: http://localhost:3001/api/health

@@ -11,7 +11,9 @@
     "dev": "concurrently -n CLIENT,SERVER -c blue,green \"npm:dev:client\" \"npm:dev:server\"",
     "dev:client": "npm run dev -w client",
     "dev:server": "npm run dev -w server",
-    "build": "npm run build -w client && npm run build -w server"
+    "build": "npm run build -w client && npm run build -w server",
+    "setup:py": "node scripts/setup-py.mjs",
+    "setup": "npm install && npm run setup:py"
   },
   "devDependencies": {
     "concurrently": "^9.1.0"

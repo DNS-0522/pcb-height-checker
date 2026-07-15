@@ -27,7 +27,7 @@
 - STP：`F:\ux3607ya.10-3d_0616\0616_1839_top_and_bottom.stp`（Allegro 17.2，PCB Design）
 
 ## 依賴
-`py -m pip install ezdxf matplotlib numpy cadquery-ocp`（Python 3.12）
+`py -m pip install -r requirements.txt`（Python 3.12;或在 repo 根目錄 `npm run setup:py`）
 
 ## DXF 腳本
 | 檔 | 用途 |

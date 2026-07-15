@@ -1,0 +1,10 @@
+# Python deps for the analysis pipeline (run_pipeline.py + glyph_match.py).
+# Install: py -m pip install -r analysis/requirements.txt   (Python 3.12, or: npm run setup:py)
+# cadquery-ocp is the big one (~150 MB, OpenCASCADE) — needed only for the `stp` subcommand.
+ezdxf
+numpy
+matplotlib
+scikit-image
+scipy
+Pillow
+cadquery-ocp
