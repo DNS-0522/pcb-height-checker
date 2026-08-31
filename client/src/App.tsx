@@ -3,6 +3,7 @@ import { CircuitBoard, Sun, Moon, Ruler, GitCompareArrows } from 'lucide-react';
 import { cn } from './lib/utils';
 import HeightCheck from './HeightCheck';
 import DxfDiff from './DxfDiff';
+import CloudSync from './CloudSync';
 
 function useTheme() {
   const [dark, setDark] = useState(() => localStorage.getItem('theme') === 'dark');
@@ -45,6 +46,8 @@ export default function App() {
               <p className="text-xs text-slate-500 mt-1">DXF 限高 × STP 零件高度檢查</p>
             </div>
           </div>
+          <div className="flex items-center space-x-1">
+          <CloudSync />
           <button
             onClick={toggle}
             className="p-2 rounded-lg text-slate-400 hover:text-blue-500 hover:bg-blue-50 dark:hover:bg-blue-900/20 transition-colors cursor-pointer"
@@ -52,6 +55,7 @@ export default function App() {
           >
             {dark ? <Sun className="w-5 h-5" /> : <Moon className="w-5 h-5" />}
           </button>
+          </div>
         </div>
         <nav className="px-4 sm:px-6 lg:px-8 flex space-x-1 border-t border-slate-100 dark:border-slate-800/60">
           {PAGES.map(({ id, label, Icon }) => (

@@ -48,7 +48,32 @@ export default function DxfDiff() {
   const [mode, setMode] = useState<ImgMode>('diff');
   const [zoom, setZoom] = useState(1);
   const [selRegion, setSelRegion] = useState<number | null>(null);
+  const [zoomRegion, setZoomRegion] = useState<{ idx: number; x0: number; y0: number; x1: number; y1: number } | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!zoomRegion) return;
+    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && setZoomRegion(null);
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [zoomRegion]);
+
+  /** open the high-res zoom modal for region i, padded for context and
+   *  clamped to the sheet extents */
+  function openZoom(i: number) {
+    if (!meta) return;
+    const r = meta.regions[i];
+    const w = r.x1 - r.x0; const h = r.y1 - r.y0;
+    const pad = Math.max(5, 0.3 * Math.max(w, h));
+    let x0 = r.x0 - pad, x1 = r.x1 + pad, y0 = r.y0 - pad, y1 = r.y1 + pad;
+    const grow = (min: number, a: number, b: number): [number, number] =>
+      b - a >= min ? [a, b] : [(a + b) / 2 - min / 2, (a + b) / 2 + min / 2];
+    [x0, x1] = grow(20, x0, x1); [y0, y1] = grow(20, y0, y1);
+    x0 = Math.max(x0, meta.x0); y0 = Math.max(y0, meta.y0);
+    x1 = Math.min(x1, meta.x1); y1 = Math.min(y1, meta.y1);
+    setSelRegion(i);
+    setZoomRegion({ idx: i, x0, y0, x1, y1 });
+  }
 
   async function start() {
     if (!fileA || !fileB) return;
@@ -225,6 +250,7 @@ export default function DxfDiff() {
                   <button
                     key={i}
                     onClick={() => setSelRegion(i === selRegion ? null : i)}
+                    onDoubleClick={() => openZoom(i)}
                     className={cn(
                       'absolute border rounded-sm cursor-pointer',
                       i === selRegion
@@ -232,7 +258,7 @@ export default function DxfDiff() {
                         : 'border-amber-400/70 hover:border-amber-500 hover:bg-amber-400/10',
                     )}
                     style={regionBox(r)}
-                    title={`差異區 #${i + 1}`}
+                    title={`差異區 #${i + 1}(雙擊高解析放大)`}
                   />
                 ))}
               </div>
@@ -266,8 +292,18 @@ export default function DxfDiff() {
                         <MapPin className="w-3 h-3 text-slate-400" />
                         <span>#{i + 1}</span>
                       </span>
-                      <span className="font-mono text-slate-400">
-                        ({r.x0.toFixed(0)}, {r.y0.toFixed(0)})
+                      <span className="flex items-center space-x-2">
+                        <span className="font-mono text-slate-400">
+                          ({r.x0.toFixed(0)}, {r.y0.toFixed(0)})
+                        </span>
+                        <span
+                          role="button"
+                          title="高解析放大此區"
+                          onClick={(e) => { e.stopPropagation(); openZoom(i); }}
+                          className="p-0.5 rounded text-slate-400 hover:text-blue-600 hover:bg-blue-50 dark:hover:bg-blue-900/30"
+                        >
+                          <ZoomIn className="w-3.5 h-3.5" />
+                        </span>
                       </span>
                     </span>
                     <span className="mt-1 flex space-x-3">
@@ -285,6 +321,83 @@ export default function DxfDiff() {
           </div>
         </section>
       )}
+
+      {zoomRegion && jobId && (
+        <ZoomModal
+          jobId={jobId}
+          region={zoomRegion}
+          onClose={() => setZoomRegion(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+// Full-screen viewer for one diff region, re-rendered server-side at high
+// resolution (up to 20 px/mm) so stroked text and fine geometry are readable.
+function ZoomModal({ jobId, region, onClose }: {
+  jobId: string;
+  region: { idx: number; x0: number; y0: number; x1: number; y1: number };
+  onClose: () => void;
+}) {
+  const [loaded, setLoaded] = useState(false);
+  const [failed, setFailed] = useState(false);
+  const r = (v: number) => (Math.round(v * 10) / 10).toFixed(1);
+  const url = `/api/dxfdiff/${jobId}/zoom?x0=${r(region.x0)}&y0=${r(region.y0)}&x1=${r(region.x1)}&y1=${r(region.y1)}`;
+  return (
+    <div
+      className="fixed inset-0 z-50 bg-slate-900/70 flex items-center justify-center p-6"
+      onClick={onClose}
+    >
+      <div
+        className="bg-white dark:bg-slate-950 rounded-xl shadow-2xl max-w-[90vw] max-h-[90vh] flex flex-col overflow-hidden"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="px-4 py-2.5 border-b border-slate-200 dark:border-slate-800 flex items-center gap-3">
+          <span className="text-sm font-semibold">差異區 #{region.idx + 1} 高解析檢視</span>
+          <span className="text-xs text-slate-400 font-mono">
+            ({r(region.x0)}, {r(region.y0)}) – ({r(region.x1)}, {r(region.y1)}) mm
+          </span>
+          <span className="text-xs text-slate-400 flex items-center space-x-2 ml-2">
+            <span className="flex items-center space-x-1">
+              <span className="w-2.5 h-2.5 rounded-sm inline-block" style={{ background: '#e11d48' }} />
+              <span>移除</span>
+            </span>
+            <span className="flex items-center space-x-1">
+              <span className="w-2.5 h-2.5 rounded-sm inline-block" style={{ background: '#16a34a' }} />
+              <span>新增</span>
+            </span>
+          </span>
+          <button
+            onClick={onClose}
+            className="ml-auto text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 cursor-pointer text-lg leading-none px-1"
+            title="關閉(Esc)"
+          >
+            ×
+          </button>
+        </div>
+        <div className="relative overflow-auto bg-white min-w-[360px] min-h-[240px]">
+          {!loaded && !failed && (
+            <div className="absolute inset-0 flex flex-col items-center justify-center space-y-2 text-slate-500 text-sm">
+              <Loader2 className="w-6 h-6 animate-spin text-blue-500" />
+              <span>高解析重渲染中(首次約 10–20 秒,之後有快取)…</span>
+            </div>
+          )}
+          {failed && (
+            <div className="absolute inset-0 flex items-center justify-center text-sm text-red-500">
+              <AlertTriangle className="w-4 h-4 mr-1.5" /> 放大渲染失敗,請重試
+            </div>
+          )}
+          <img
+            src={url}
+            alt={`差異區 #${region.idx + 1}`}
+            onLoad={() => setLoaded(true)}
+            onError={() => setFailed(true)}
+            className={cn('block max-w-[88vw] max-h-[78vh] object-contain select-none', !loaded && 'opacity-0')}
+            draggable={false}
+          />
+        </div>
+      </div>
     </div>
   );
 }

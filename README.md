@@ -49,3 +49,18 @@ npm run dev          # runs client (5173) + server (3001) together
 - [ ] **Phase 2** — two-revision DXF diff (overlay + change list)
 - [ ] **Phase 3** — coordinate registration + height-violation check
 - [ ] **Phase 4** — report export (Excel/PDF), saved comparisons
+
+## OneDrive 工作狀態同步(方案 B)
+
+資料集可推送/拉回 OneDrive 的應用程式資料夾(`應用程式/<App名稱>/boards/<boardId>/`),權限僅 `Files.ReadWrite.AppFolder`。
+
+一次性設定:
+1. https://portal.azure.com → Microsoft Entra ID → App registrations → New registration
+   - Supported account types 選「Any org directory + personal Microsoft accounts」
+   - 不需 Redirect URI
+2. 該 App → Authentication → Advanced settings → **Allow public client flows = Yes**
+3. API permissions → Add → Microsoft Graph → Delegated → `Files.ReadWrite.AppFolder`
+4. 把 Application (client) ID 填入 `server/cloud.config.json`(git-ignored):`{ "clientId": "..." }`
+
+之後在網頁 header 的雲朵按鈕登入(device code 流程)、上傳/下載板子。
+Token cache 存於 `server/data/.msal-cache.json`(git-ignored)。

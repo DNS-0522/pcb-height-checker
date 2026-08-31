@@ -23,7 +23,8 @@ TEMPLATES = os.path.join(HERE, 'glyph_templates.json')
 MAX_SEG = 8.0        # mm — glyph strokes only
 PIECE_GAP = 0.38     # mm — sub-cluster gap that separates characters
 SAMPLE_STEP = 0.04   # normalized units between sampled points
-DOT_MAX_H = 0.30     # piece height (normalized to label height) below which it's '.'
+DOT_MAX_H = 0.30     # piece height/width (normalized to label height) of a dot-sized piece
+DOT_BASE_MAX = 0.30  # dot centre must sit within this fraction of label height above baseline
 
 # ---------------------------------------------------------------- geometry
 def collect_segments(msp):
@@ -185,20 +186,36 @@ def recognize_label(strokes_raw, templates):
             info.append({'pts': pts, 'cx': (lo[0]+hi[0])/2, 'cy': (lo[1]+hi[1])/2,
                          'h': h, 'w': w})
         info.sort(key=lambda p: p['cx'])
-        out = []      # (char, score, piece)
-        ambiguous = False
+        out = []      # (char, score, piece, ambiguous)
+        ymin = allpts[:, 1].min()
         for p in info:
-            if p['h'] < DOT_MAX_H and p['w'] < DOT_MAX_H:
-                out.append(('.', 0.0, p)); continue
+            small = p['h'] < DOT_MAX_H and p['w'] < DOT_MAX_H
+            if '.' not in tmpl:
+                # legacy template file without a dot template: size shortcut
+                if small:
+                    out.append(('.', 0.0, p, False)); continue
+            amb = False
             norm = normalize_piece(p['pts'], label_h)
             scores = {ch: chamfer(norm, t) for ch, t in tmpl.items()}
             ranked = sorted(scores.items(), key=lambda kv: kv[1])
             ch, sc = ranked[0]
+            if ch == '.':
+                # a decimal dot must be dot-sized AND sit on the baseline;
+                # anything else that shape-matches '.' is stray geometry
+                on_base = (p['cy'] - ymin) / label_h <= DOT_BASE_MAX
+                if not (small and on_base):
+                    non_dot = [kv for kv in ranked if kv[0] != '.']
+                    if non_dot:
+                        ch, sc = non_dot[0]
+                    amb = True
+            elif small:
+                # dot-sized piece read as a digit: suspicious either way
+                amb = True
             # near-tie between two characters (e.g. 5 vs 6): never silently pick
             if len(ranked) > 1 and ranked[1][1] - sc < 0.018:
-                ambiguous = True
-            out.append((ch, sc, p))
-        s = ''.join(ch for ch, _, _ in out)
+                amb = True
+            out.append((ch, sc, p, amb))
+        s = ''.join(ch for ch, _, _, _ in out)
         import re
         FMT = r'H=(0|[1-9]\d*)(\.\d+)?'   # no leading zeros: 'H=01' is a misread
         m = re.fullmatch(FMT, s) or re.search(FMT + r'$', s) or re.search(FMT, s)
@@ -207,8 +224,8 @@ def recognize_label(strokes_raw, templates):
         if valid:
             s = m.group(0)
             used = out[m.start():m.end()]   # 1 char = 1 piece
-        worst = max((sc for _, sc, _ in used), default=9.9)
-        if ambiguous:
+        worst = max((sc for _, sc, _, _ in used), default=9.9)
+        if any(amb for _, _, _, amb in used):
             worst = max(worst, 0.5)   # force low confidence -> review
         rank = (0 if valid else 1, worst)
         if best is None or rank < best[0]:
@@ -269,8 +286,6 @@ def main():
                 print(f'  SKIP idx{idx} {text}: no variant gives {len(expect)} pieces', file=sys.stderr)
                 continue
             for (cx, pts), ch in zip(info, expect):
-                if ch == '.':          # size-classified at recognition
-                    continue
                 if ch in templates:
                     continue
                 templates[ch] = normalize_piece(pts, label_h).round(4).tolist()

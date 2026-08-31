@@ -88,6 +88,44 @@ dxfDiffRouter.get('/:id/diff.json', (req, res) => {
   res.sendFile(join(job.dir, 'diff.json'));
 });
 
+// High-res zoom of one region: re-render both revisions cropped to the given
+// sheet-mm window (run_pipeline.py diffzoom) and serve the composed diff crop.
+// Results are cached on disk per rounded window; concurrent identical requests
+// share one python run.
+const zoomRuns = new Map<string, Promise<boolean>>();
+
+dxfDiffRouter.get('/:id/zoom', (req, res) => {
+  const job = jobs.get(req.params.id);
+  if (!job) return res.status(404).json({ error: 'unknown job' });
+  const nums = ['x0', 'y0', 'x1', 'y1'].map((k) => Number(req.query[k]));
+  if (nums.some((n) => !Number.isFinite(n))) {
+    return res.status(400).json({ error: 'x0/y0/x1/y1 需為數字(圖面 mm 座標)' });
+  }
+  const r = (v: number) => Math.round(v * 10) / 10;
+  const [x0, y0, x1, y1] = nums.map(r);
+  if (x1 - x0 < 1 || y1 - y0 < 1 || x1 - x0 > 600 || y1 - y0 > 600) {
+    return res.status(400).json({ error: '放大範圍需在 1–600 mm 之間' });
+  }
+  const name = `zoom_${x0.toFixed(1)}_${y0.toFixed(1)}_${x1.toFixed(1)}_${y1.toFixed(1)}.jpg`;
+  const p = join(job.dir, name);
+  if (existsSync(p)) return res.sendFile(p);
+  const key = `${job.id}:${name}`;
+  let run = zoomRuns.get(key);
+  if (!run) {
+    run = new Promise<boolean>((resolvePromise) =>
+      runPy(job, 'zoom',
+        ['diffzoom', '--dxf', join(job.dir, 'a.dxf'), '--dxf-b', join(job.dir, 'b.dxf'),
+         '--out', job.dir, '--region', `${x0},${y0},${x1},${y1}`],
+        (code) => resolvePromise(code === 0)));
+    zoomRuns.set(key, run);
+    run.finally(() => zoomRuns.delete(key));
+  }
+  run.then((ok) => {
+    if (ok && existsSync(p)) res.sendFile(p);
+    else res.status(500).json({ error: '區塊放大渲染失敗,詳見 job log' });
+  });
+});
+
 dxfDiffRouter.get('/:id/img/:name', (req, res) => {
   const job = jobs.get(req.params.id);
   const { name } = req.params;

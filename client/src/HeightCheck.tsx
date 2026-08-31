@@ -10,6 +10,7 @@ import {
   FileUp,
   PenLine,
   RefreshCw,
+  X,
 } from 'lucide-react';
 import { cn, fmt } from './lib/utils';
 import UploadWizard from './UploadWizard';
@@ -164,6 +165,7 @@ export default function HeightCheck() {
   const [showAlign, setShowAlign] = useState(true);
   const [focusLabel, setFocusLabel] = useState<string | null>(null);
   const [locateZone, setLocateZone] = useState<Zone | null>(null);
+  const [editZoneId, setEditZoneId] = useState<string | null>(null);
   const boardRef = useRef<HTMLElement | null>(null);
   const [mode, setMode] = useState<'result' | 'debug'>('result');
   const [debugBase, setDebugBase] = useState<'draw' | 'walls' | 'cc'>('cc');
@@ -172,11 +174,15 @@ export default function HeightCheck() {
   const [debugOutlines, setDebugOutlines] = useState(true);
 
   useEffect(() => {
-    if (!locateZone) return;
-    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && setLocateZone(null);
+    if (!locateZone && !editZoneId) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') { setLocateZone(null); setEditZoneId(null); }
+    };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [locateZone]);
+  }, [locateZone, editZoneId]);
+
+  useEffect(() => { setEditZoneId(null); }, [boardId, view]);
 
   const refreshBoards = useCallback(async (): Promise<BoardInfo[]> => {
     const res = await fetch('/api/heightcheck/boards');
@@ -696,7 +702,10 @@ export default function HeightCheck() {
                     key={z.id}
                     points={z.polygon.map(([x, y]) => `${x},${-y}`).join(' ')}
                     fill="transparent"
-                    stroke="none"
+                    stroke={editZoneId === z.id ? '#2563eb' : 'none'}
+                    strokeWidth={editZoneId === z.id ? 0.9 : 0}
+                    className="cursor-pointer"
+                    onClick={() => setEditZoneId(editZoneId === z.id ? null : z.id)}
                     onMouseMove={(e) =>
                       setHover({
                         x: e.clientX,
@@ -704,6 +713,7 @@ export default function HeightCheck() {
                         lines: [
                           `區 ${z.num ?? z.id}${nolimit ? ':已確認無限制' : ''}`,
                           z.areaMm2 ? `面積 ${fmt(z.areaMm2, 0)} mm²` : '',
+                          '點一下可編輯限高',
                         ].filter(Boolean),
                       })
                     }
@@ -716,17 +726,17 @@ export default function HeightCheck() {
                   points={z.polygon.map(([x, y]) => `${x},${-y}`).join(' ')}
                   fill={pending ? '#f59e0b' : zoneColor(z.value!)}
                   fillOpacity={pending ? 0.18 : z.value === 0 ? 0.28 : 0.34}
-                  stroke={pending ? '#f59e0b' : z.conflict ? '#dc2626' : zoneColor(z.value!)}
-                  strokeWidth={z.conflict || pending ? 0.6 : 0.25}
+                  stroke={editZoneId === z.id ? '#2563eb' : pending ? '#f59e0b' : z.conflict ? '#dc2626' : zoneColor(z.value!)}
+                  strokeWidth={editZoneId === z.id ? 0.9 : z.conflict || pending ? 0.6 : 0.25}
                   strokeDasharray={z.conflict || pending ? '1.5 1' : undefined}
-                  className={pending ? 'cursor-pointer' : undefined}
+                  className="cursor-pointer"
                   onClick={
                     pending
                       ? () => {
                           setFocusLabel(z.id);
                           document.getElementById(`pending-${z.id}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
                         }
-                      : undefined
+                      : () => setEditZoneId(editZoneId === z.id ? null : z.id)
                   }
                   onMouseMove={(e) =>
                     setHover({
@@ -739,6 +749,7 @@ export default function HeightCheck() {
                             `區 ${z.num ?? z.id} · 限高 H=${z.value}${z.overridden ? '(人工)' : ''}`,
                             z.conflict ? `⚠ 多重標註 {${z.labelValues.join(', ')}} 取較低` : '',
                             z.areaMm2 ? `面積 ${fmt(z.areaMm2, 0)} mm²` : '',
+                            '點一下可編輯限高',
                           ].filter(Boolean),
                     })
                   }
@@ -862,6 +873,21 @@ export default function HeightCheck() {
               ))}
             </div>
           )}
+          {mode === 'result' && editZoneId && (() => {
+            const z = zones.find((x) => x.id === editZoneId && x.view === view);
+            if (!z || z.state === 'pending') return null;
+            return (
+              <ZoneEditCard
+                key={`${z.id}:${z.value}:${z.state}`}
+                zone={z}
+                onSave={async (id, v) => {
+                  await saveZone(id, v);
+                  setEditZoneId(null);
+                }}
+                onClose={() => setEditZoneId(null)}
+              />
+            );
+          })()}
         </div>
         <div className="px-4 py-2 border-t border-slate-200 dark:border-slate-800 flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-slate-400">
           {[0, 0.5, 0.75, 1, 1.2, 2, 3].map((v) => (
@@ -1217,6 +1243,83 @@ function PendingZoneCard({
             className="px-2.5 py-1 border border-blue-300 dark:border-blue-800 text-blue-600 dark:text-blue-400 rounded text-xs cursor-pointer hover:bg-blue-50 dark:hover:bg-blue-900/20 disabled:opacity-50"
           >
             套用上一版:{suggest === 'nolimit' ? '無限制' : suggest}
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// Floating editor for any already-valued zone: override H, mark 無限制, or
+// clear the override to fall back to the auto-read value.
+function ZoneEditCard({ zone, onSave, onClose }: {
+  zone: Zone;
+  onSave: (zoneId: string, value: number | 'nolimit' | null) => Promise<void> | void;
+  onClose: () => void;
+}) {
+  const [val, setVal] = useState(zone.value !== null ? String(zone.value) : '');
+  const [saving, setSaving] = useState(false);
+  const inputRef = useRef<HTMLInputElement>(null);
+  useEffect(() => { inputRef.current?.focus({ preventScroll: true }); }, []);
+  const autoVals = zone.labelValues ?? [];
+  const act = async (v: number | 'nolimit' | null) => {
+    setSaving(true);
+    try { await onSave(zone.id, v); } finally { setSaving(false); }
+  };
+  return (
+    <div className="absolute top-3 right-3 z-40 w-64 rounded-xl border border-blue-300 dark:border-blue-800 bg-white dark:bg-slate-950 shadow-lg p-3 space-y-2">
+      <div className="flex items-center justify-between">
+        <span className="text-sm font-bold text-blue-600 dark:text-blue-400">
+          編輯區 {zone.num ?? zone.id}
+        </span>
+        <button onClick={onClose} className="text-slate-400 hover:text-slate-600 cursor-pointer" title="關閉(Esc)">
+          <X className="w-4 h-4" />
+        </button>
+      </div>
+      <div className="text-xs text-slate-500 space-y-0.5">
+        <div>
+          目前:{zone.state === 'nolimit' ? '無限制' : `H=${zone.value}`}
+          {zone.overridden ? '(人工覆寫)' : '(自動讀值)'}
+        </div>
+        {autoVals.length > 0 && (
+          <div>圖面讀到:{'{'}{autoVals.join(', ')}{'}'}{zone.conflict ? ' ⚠ 多重標註' : ''}</div>
+        )}
+        {zone.areaMm2 != null && <div>面積 {fmt(zone.areaMm2, 0)} mm²</div>}
+      </div>
+      <div className="flex items-center gap-1.5 flex-wrap">
+        <span className="text-xs text-slate-500">H=</span>
+        <input
+          ref={inputRef}
+          type="number"
+          step="0.05"
+          min="0"
+          value={val}
+          onChange={(e) => setVal(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter' && val !== '' && !saving) act(Number(val)); }}
+          className="w-16 rounded border border-slate-300 dark:border-slate-700 bg-transparent px-2 py-1 text-sm outline-none focus:ring-2 focus:ring-blue-500"
+        />
+        <button
+          disabled={val === '' || saving}
+          onClick={() => act(Number(val))}
+          className="px-2.5 py-1 bg-blue-600 hover:bg-blue-700 text-white rounded text-xs font-medium cursor-pointer disabled:opacity-50"
+        >
+          {saving ? '…' : '儲存'}
+        </button>
+        <button
+          disabled={saving}
+          onClick={() => act('nolimit')}
+          className="px-2.5 py-1 border border-slate-300 dark:border-slate-600 text-slate-500 rounded text-xs cursor-pointer hover:border-amber-400 disabled:opacity-50"
+        >
+          無限制
+        </button>
+        {zone.overridden && (
+          <button
+            disabled={saving}
+            onClick={() => act(null)}
+            title="移除人工覆寫,恢復圖面自動讀值"
+            className="px-2.5 py-1 border border-blue-300 dark:border-blue-800 text-blue-600 dark:text-blue-400 rounded text-xs cursor-pointer hover:bg-blue-50 dark:hover:bg-blue-900/20 disabled:opacity-50"
+          >
+            還原自動讀值
           </button>
         )}
       </div>
