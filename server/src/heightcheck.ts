@@ -92,14 +92,15 @@ function loadBoard(boardId: string) {
   const components = JSON.parse(readFileSync(join(dir, 'components.json'), 'utf-8')) as BoardComponent[];
   let labels: HLabel[] = [];
   const labelsPath = join(dir, 'labels.json');
-  if (existsSync(labelsPath)) {
+  const hasLabels = existsSync(labelsPath);
+  // zone H values derive from auto-read labels (min on conflict, ruling d1),
+  // then user zone-overrides win. Zones without any value are the review queue.
+  const overridesPath = join(dir, 'zone_overrides.json');
+  const overrides: Record<string, ZoneOverride> = existsSync(overridesPath)
+    ? JSON.parse(readFileSync(overridesPath, 'utf-8'))
+    : {};
+  if (hasLabels) {
     labels = JSON.parse(readFileSync(labelsPath, 'utf-8')) as HLabel[];
-    // zone H values derive from auto-read labels (min on conflict, ruling d1),
-    // then user zone-overrides win. Zones without any value are the review queue.
-    const overridesPath = join(dir, 'zone_overrides.json');
-    const overrides: Record<string, ZoneOverride> = existsSync(overridesPath)
-      ? JSON.parse(readFileSync(overridesPath, 'utf-8'))
-      : {};
     const zoneVals = new Map<string, number[]>();
     for (const l of labels) {
       if (l.zoneId && l.value !== null) {
@@ -112,19 +113,24 @@ function loadBoard(boardId: string) {
       z.labelValues = [...new Set(vals)].sort((a, b) => a - b);
       z.value = vals.length ? Math.min(...vals) : null;
       z.conflict = new Set(vals).size > 1;
-      const ov = overrides[z.id];
-      z.overridden = ov !== undefined;
-      if (ov === 'nolimit') {
-        z.value = null;
-        z.state = 'nolimit';
-      } else if (typeof ov === 'number') {
-        z.value = ov;
-        z.state = 'valued';
-        z.conflict = false;
-      } else {
-        z.state = z.value !== null ? 'valued' : 'pending';
-      }
     }
+  }
+  // overrides apply to every dataset, labelled or not (builtin demo included)
+  for (const z of zones) {
+    const ov = overrides[z.id];
+    z.overridden = ov !== undefined;
+    if (ov === 'nolimit') {
+      z.value = null;
+      z.state = 'nolimit';
+    } else if (typeof ov === 'number') {
+      z.value = ov;
+      z.state = 'valued';
+      z.conflict = false;
+    } else {
+      z.state = z.value !== null ? 'valued' : hasLabels ? 'pending' : z.state;
+    }
+  }
+  if (hasLabels) {
     // friendly numbers: per view, big zones first
     for (const view of ['TOP_LIMIT', 'BOT_LIMIT'] as const) {
       const vz = zones.filter((z) => z.view === view)
@@ -133,19 +139,24 @@ function loadBoard(boardId: string) {
         z.num = `${view === 'TOP_LIMIT' ? 'T' : 'B'}-${String(i + 1).padStart(2, '0')}`;
       });
     }
-    const zoneById = new Map(zones.map((z) => [z.id, z]));
-    for (const c of components) {
-      const z = c.zoneId ? zoneById.get(c.zoneId) : undefined;
-      c.allowed = z?.value ?? null;
-      c.zoneConflict = z?.conflict ?? false;
-    }
+  }
+  // component limits always re-derive from zones so overrides take effect
+  const zoneById = new Map(zones.map((z) => [z.id, z]));
+  for (const c of components) {
+    if (!c.zoneId) continue;
+    const z = zoneById.get(c.zoneId);
+    c.allowed = z?.value ?? null;
+    c.zoneConflict = z?.conflict ?? false;
   }
   return { dir, meta, zones, components, labels };
 }
 
 export function judge(c: BoardComponent, rules: CheckRules): Status {
   if (c.placeholder && rules.placeholderMode === 'flag') return 'placeholder';
-  if (c.allowed === null) return 'no_limit';
+  // == null also catches undefined: a component OUTSIDE every zone never gets
+  // `allowed` assigned in loadBoard — it must surface as no_limit, not slip
+  // through the h > undefined+tol (NaN) comparison as 'ok'
+  if (c.allowed == null) return 'no_limit';
   if (c.allowed === 0) {
     if (rules.keepoutMode === 'strict') return 'violation';
     if (rules.keepoutMode === 'threshold')

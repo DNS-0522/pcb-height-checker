@@ -18,6 +18,9 @@ Thumbs.db
 server/uploads/
 server/diffs/
 
+# OneDrive sync credentials (Azure app client id + MSAL token cache under server/data/)
+server/cloud.config.json
+
 # analysis working artifacts (regenerable)
 analysis/__pycache__/
 analysis/renders/

@@ -4,6 +4,7 @@ import { stpRouter } from './stp';
 import { heightCheckRouter } from './heightcheck';
 import { analyzeRouter } from './analyze';
 import { dxfDiffRouter } from './dxfdiff';
+import { cloudRouter } from './cloud';
 
 const app = express();
 // Note: do NOT read process.env.PORT — the preview panel injects PORT=<client
@@ -22,6 +23,7 @@ app.use('/api/stp', stpRouter);
 app.use('/api/heightcheck', heightCheckRouter);
 app.use('/api/analyze', analyzeRouter);
 app.use('/api/dxfdiff', dxfDiffRouter);
+app.use('/api/cloud', cloudRouter);
 
 app.listen(PORT, () => {
   console.log(`[server] listening on http://localhost:${PORT}`);

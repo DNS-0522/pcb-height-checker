@@ -177,6 +177,57 @@ def glyph_erase_mask(shape, view_labels, segs_all, msp, vb, scale):
     protect = binary_dilation(protect, footprint=np.ones((3, 3)))
     return glyph & ~protect
 
+def safe_glyph_erase(walls_raw, view_labels, segs_all, msp, vb, scale):
+    """glyph_erase_mask + leak guard, returns the final dilated walls.
+
+    The erase can misclassify a SHORT boundary segment as a glyph stroke (its
+    bbox center inside the label bbox, size near the glyph median) — protect-1
+    excludes chosen strokes by definition and protect-2 only covers entities
+    >8mm, so cramped compartments could get their wall erased open. Guard:
+    compare enclosed regions before/after the erase; if an enclosed region
+    leaked into the outside, cancel the erase of the labels touching the leak
+    and retry (their glyphs stay walls, which at worst splits that zone)."""
+    from collections import Counter as _Counter
+    from skimage import measure
+    from skimage.morphology import binary_dilation
+    Hpx, Wpx = walls_raw.shape
+    fp = np.ones((3, 3))
+
+    def flood(walls):
+        comp = measure.label(~walls, connectivity=1)
+        border = _Counter(list(comp[0, :]) + list(comp[-1, :]) +
+                          list(comp[:, 0]) + list(comp[:, -1]))
+        return comp, border.most_common(1)[0][0]
+
+    base = binary_dilation(walls_raw, footprint=fp)
+    if not view_labels:
+        return base
+    comp0, out0 = flood(base)
+    enclosed0 = (comp0 != out0) & (comp0 != 0)
+    active = list(view_labels)
+    for _ in range(4):
+        erase = glyph_erase_mask(walls_raw.shape, active, segs_all, msp, vb, scale)
+        walls = binary_dilation(walls_raw & ~erase, footprint=fp)
+        comp, out = flood(walls)
+        leaked = enclosed0 & (comp == out)
+        if leaked.sum() < 0.5 * scale * scale:   # <0.5mm² is raster noise
+            return walls
+        culprits = []
+        for l in active:
+            c0 = max(0, int((l['x0'] - 1.0 - vb[0]) * scale))
+            c1 = min(Wpx, int((l['x1'] + 1.0 - vb[0]) * scale) + 1)
+            r0 = max(0, int(Hpx - 1 - (l['y1'] + 1.0 - vb[1]) * scale))
+            r1 = min(Hpx, int(Hpx - 1 - (l['y0'] - 1.0 - vb[1]) * scale) + 1)
+            if r1 > r0 and c1 > c0 and leaked[r0:r1, c0:c1].any():
+                culprits.append(l)
+        if not culprits:
+            return walls
+        ids = {id(l) for l in culprits}
+        active = [l for l in active if id(l) not in ids]
+        print(f'[erase-guard] 回滾 {len(culprits)} 個標註的字形擦除(避免區域漏出): '
+              + ','.join(str(l.get("id", "?")) for l in culprits), flush=True)
+    return walls
+
 def emit_debug(out, view, vb, scale, walls, comp_img, outside_id):
     """Per-view debug artifacts for the UI's zone-cutting debug mode:
     walls bitmap, randomly-coloured CC image, and per-zone outlines."""
@@ -620,9 +671,8 @@ def cmd_extract(args):
         save_view_jpg(view_img, f'view_{view}.jpg')
         # H-label glyph strokes are not zone boundaries: erase them BEFORE the
         # dilation (which re-closes any <=2px nick the erase leaves in a real line)
-        walls &= ~glyph_erase_mask(walls.shape, [l for l in labels if l['view'] == view],
-                                   segs_all, msp, vb, SCALE)
-        walls = binary_dilation(walls, footprint=np.ones((3, 3)))
+        walls = safe_glyph_erase(walls, [l for l in labels if l['view'] == view],
+                                 segs_all, msp, vb, SCALE)
         comp_img = measure.label(~walls, connectivity=1)
         comp_area = np.bincount(comp_img.ravel())
         Hpx, Wpx = comp_img.shape
@@ -969,9 +1019,10 @@ def cmd_register(args):
         plt.close(fig)
         Image.fromarray(img).save(os.path.join(out, f'view_{view}.jpg'), 'JPEG', quality=72)
         if segs_all is not None:
-            walls &= ~glyph_erase_mask(walls.shape, [l for l in all_labels if l['view'] == view],
-                                       segs_all, msp, vb, SCALE)
-        walls = binary_dilation(walls, footprint=np.ones((3, 3)))
+            walls = safe_glyph_erase(walls, [l for l in all_labels if l['view'] == view],
+                                     segs_all, msp, vb, SCALE)
+        else:
+            walls = binary_dilation(walls, footprint=np.ones((3, 3)))
         comp_img = measure.label(~walls, connectivity=1)
         Hpx, Wpx = comp_img.shape
         border = Counter(list(comp_img[0, :]) + list(comp_img[-1, :]) +
@@ -1121,6 +1172,82 @@ def cmd_diff(args):
                'regions': regions[:300], 'regionsTotal': len(regions)},
               open(os.path.join(args.out, 'diff.json'), 'w'))
     progress(100, f'比對完成:{len(regions)} 個差異區域')
+
+def cmd_diffzoom(args):
+    """High-res zoom of one diff region: re-render both revisions cropped to
+    --region (x0,y0,x1,y1 sheet mm) at up to 20 px/mm and compose the same
+    red/green/gray pixel diff. Writes <name>.jpg into --out (name printed as
+    ZOOM <name>). Entities are pre-filtered by a rough bbox so a small window
+    renders in seconds instead of re-rasterizing the whole sheet."""
+    import ezdxf
+    import matplotlib; matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from ezdxf.addons.drawing import Frontend, RenderContext
+    from ezdxf.addons.drawing.matplotlib import MatplotlibBackend
+    from ezdxf.addons.drawing.config import Configuration, BackgroundPolicy, ColorPolicy
+    from skimage.morphology import binary_dilation
+    from PIL import Image
+
+    x0, y0, x1, y1 = [float(v) for v in args.region.split(',')]
+    if x1 - x0 < 1 or y1 - y0 < 1 or x1 - x0 > 600 or y1 - y0 > 600:
+        print('ERROR region 尺寸需在 1–600 mm 之間', flush=True)
+        sys.exit(2)
+    m = 5.0  # filter margin, mm (covers strokes crossing the window edge)
+
+    def rough_hit(e):
+        t = e.dxftype()
+        try:
+            if t == 'LINE':
+                a, b = e.dxf.start, e.dxf.end
+                return not (max(a.x, b.x) < x0-m or min(a.x, b.x) > x1+m
+                            or max(a.y, b.y) < y0-m or min(a.y, b.y) > y1+m)
+            if t in ('CIRCLE', 'ARC'):
+                c, r = e.dxf.center, e.dxf.radius
+                return not (c.x+r < x0-m or c.x-r > x1+m or c.y+r < y0-m or c.y-r > y1+m)
+            if t == 'LWPOLYLINE':
+                pts = [(p[0], p[1]) for p in e.get_points()]
+                xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
+                return not (max(xs) < x0-m or min(xs) > x1+m
+                            or max(ys) < y0-m or min(ys) > y1+m)
+        except Exception:
+            return True
+        return True   # unknown types: keep (rare; correctness over speed)
+
+    SCALE = min(20.0, 1600 / max(x1 - x0, y1 - y0))
+    cfg = Configuration(background_policy=BackgroundPolicy.WHITE, color_policy=ColorPolicy.BLACK)
+    dpi = 100
+    walls = []
+    for i, path in enumerate([args.dxf, args.dxf_b]):
+        progress(5 + i * 45, f'渲染{"舊版" if i == 0 else "新版"}區塊…')
+        doc = ezdxf.readfile(path)
+        ents = [e for e in doc.modelspace() if rough_hit(e)]
+        fig = plt.figure(figsize=((x1-x0)*SCALE/dpi, (y1-y0)*SCALE/dpi), dpi=dpi)
+        ax = fig.add_axes([0, 0, 1, 1]); ax.set_facecolor('white')
+        Frontend(RenderContext(doc), MatplotlibBackend(ax), config=cfg).draw_entities(ents)
+        ax.set_xlim(x0, x1); ax.set_ylim(y0, y1); ax.set_aspect('equal'); ax.axis('off')
+        fig.canvas.draw()
+        buf = np.asarray(fig.canvas.buffer_rgba())[:, :, :3]
+        walls.append(buf.mean(axis=2) < 128)
+        plt.close(fig)
+    a, b = walls
+    progress(95, '合成差異…')
+    # same-shape guard: identical figure size can still differ by a rounding px
+    hh = min(a.shape[0], b.shape[0]); ww = min(a.shape[1], b.shape[1])
+    a, b = a[:hh, :ww], b[:hh, :ww]
+    # tolerance scales with resolution so the anti-alias fringe stays quiet
+    k = max(3, int(round(SCALE / 3.5)) | 1)
+    fp = np.ones((k, k), dtype=bool)
+    only_a = a & ~binary_dilation(b, footprint=fp)
+    only_b = b & ~binary_dilation(a, footprint=fp)
+    both = (a | b) & ~only_a & ~only_b
+    img = np.full((hh, ww, 3), 255, np.uint8)
+    img[both] = (148, 155, 164)
+    img[only_a] = (225, 29, 72)
+    img[only_b] = (22, 163, 74)
+    name = f'zoom_{x0:.1f}_{y0:.1f}_{x1:.1f}_{y1:.1f}.jpg'
+    Image.fromarray(img).save(os.path.join(args.out, name), 'JPEG', quality=85)
+    print(f'ZOOM {name}', flush=True)
+    progress(100, '區塊放大完成')
 
 def cmd_carryover(args):
     """DXF-replacement carry-over: diff the previous revision (--dxf-b) against
@@ -1324,9 +1451,10 @@ def cmd_debugviz(args):
         walls = np.asarray(fig.canvas.buffer_rgba())[:, :, :3].mean(axis=2) < 128
         plt.close(fig)
         if segs_all is not None:
-            walls &= ~glyph_erase_mask(walls.shape, [l for l in all_labels if l['view'] == view],
-                                       segs_all, msp, vb, SCALE)
-        walls = binary_dilation(walls, footprint=np.ones((3, 3)))
+            walls = safe_glyph_erase(walls, [l for l in all_labels if l['view'] == view],
+                                     segs_all, msp, vb, SCALE)
+        else:
+            walls = binary_dilation(walls, footprint=np.ones((3, 3)))
         comp_img = measure.label(~walls, connectivity=1)
         border = Counter(list(comp_img[0, :]) + list(comp_img[-1, :]) +
                          list(comp_img[:, 0]) + list(comp_img[:, -1]))
@@ -1337,14 +1465,16 @@ def cmd_debugviz(args):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('cmd', choices=['overview', 'stp', 'extract', 'alignment', 'register', 'debugviz', 'diff', 'carryover'])
+    ap.add_argument('cmd', choices=['overview', 'stp', 'extract', 'alignment', 'register', 'debugviz', 'diff', 'diffzoom', 'carryover'])
     ap.add_argument('--dxf'); ap.add_argument('--dxf-b'); ap.add_argument('--stp')
     ap.add_argument('--views'); ap.add_argument('--out', required=True)
+    ap.add_argument('--region')  # diffzoom: "x0,y0,x1,y1" in sheet mm
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
     {'overview': cmd_overview, 'stp': cmd_stp, 'extract': cmd_extract,
      'alignment': cmd_alignment, 'register': cmd_register,
-     'debugviz': cmd_debugviz, 'diff': cmd_diff, 'carryover': cmd_carryover}[args.cmd](args)
+     'debugviz': cmd_debugviz, 'diff': cmd_diff, 'diffzoom': cmd_diffzoom,
+     'carryover': cmd_carryover}[args.cmd](args)
 
 if __name__ == '__main__':
     main()
