@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { UPLOADS_DIR } from './analyze';
 
@@ -66,7 +66,7 @@ export interface CheckRules {
 
 export type Status = 'ok' | 'violation' | 'keepout' | 'no_limit' | 'placeholder';
 
-const DEFAULT_RULES: CheckRules = {
+export const DEFAULT_RULES: CheckRules = {
   toleranceMm: 0.05,
   keepoutMode: 'list',
   keepoutThresholdMm: 0.5,
@@ -75,7 +75,7 @@ const DEFAULT_RULES: CheckRules = {
 
 const DATA_DIR = join(__dirname, '..', 'data');
 
-function boardDir(boardId: string): string | null {
+export function boardDir(boardId: string): string | null {
   if (!/^[\w-]+$/.test(boardId)) return null;
   for (const base of [DATA_DIR, UPLOADS_DIR]) {
     const dir = join(base, boardId);
@@ -84,7 +84,7 @@ function boardDir(boardId: string): string | null {
   return null;
 }
 
-function loadBoard(boardId: string) {
+export function loadBoard(boardId: string) {
   const dir = boardDir(boardId);
   if (!dir) throw new Error('unknown board');
   const meta = JSON.parse(readFileSync(join(dir, 'meta.json'), 'utf-8'));
@@ -170,7 +170,12 @@ export const heightCheckRouter = Router();
 
 // Available boards: built-in datasets + finished uploads.
 heightCheckRouter.get('/boards', (_req, res) => {
-  const out: { id: string; title: string; source: string }[] = [];
+  const out: {
+    id: string; title: string; source: string;
+    note: string | null; extractedAt: string | null; dxf: string | null; stp: string | null;
+    /** 資料集內留有 input.dxf → 才能「更換 DXF / STP」重跑(精簡匯入的板卡沒有) */
+    hasCad: boolean;
+  }[] = [];
   for (const [base, source] of [[DATA_DIR, 'builtin'], [UPLOADS_DIR, 'upload']] as const) {
     if (!existsSync(base)) continue;
     for (const id of readdirSync(base)) {
@@ -181,11 +186,52 @@ heightCheckRouter.get('/boards', (_req, res) => {
       if (!existsSync(join(base, id, 'components.json'))) continue;
       try {
         const meta = JSON.parse(readFileSync(metaPath, 'utf-8'));
-        out.push({ id, title: meta.title ?? id, source });
+        out.push({
+          id, title: meta.title ?? id, source,
+          note: meta.note ?? null,
+          extractedAt: meta.extractedAt ?? null,
+          dxf: meta.dxf ?? null, stp: meta.stp ?? null,
+          hasCad: existsSync(join(base, id, 'input.dxf')),
+        });
       } catch { /* skip broken */ }
     }
   }
   res.json(out);
+});
+
+// Board management: rename / annotate a dataset (stored in its meta.json).
+heightCheckRouter.patch('/board/:boardId', (req, res) => {
+  const dir = boardDir(req.params.boardId);
+  if (!dir) return res.status(404).json({ error: 'unknown board' });
+  const { title, note } = (req.body ?? {}) as { title?: unknown; note?: unknown };
+  if (title !== undefined && (typeof title !== 'string' || !title.trim() || title.length > 120)) {
+    return res.status(400).json({ error: 'title 需為 1–120 字的字串' });
+  }
+  if (note !== undefined && note !== null && (typeof note !== 'string' || note.length > 500)) {
+    return res.status(400).json({ error: 'note 需為 500 字內的字串或 null' });
+  }
+  const metaPath = join(dir, 'meta.json');
+  const meta = JSON.parse(readFileSync(metaPath, 'utf-8'));
+  if (typeof title === 'string') meta.title = title.trim();
+  if (note !== undefined) {
+    if (note === null || note === '') delete meta.note;
+    else meta.note = note;
+  }
+  writeFileSync(metaPath, JSON.stringify(meta));
+  res.json({ ok: true });
+});
+
+// Delete an uploaded dataset. Built-in datasets (server/data/) are protected.
+heightCheckRouter.delete('/board/:boardId', (req, res) => {
+  const id = req.params.boardId;
+  if (!/^[\w-]+$/.test(id)) return res.status(400).json({ error: 'bad board id' });
+  if (existsSync(join(DATA_DIR, id, 'meta.json'))) {
+    return res.status(403).json({ error: '內建示範資料集不能刪除' });
+  }
+  const dir = join(UPLOADS_DIR, id);
+  if (!existsSync(join(dir, 'meta.json'))) return res.status(404).json({ error: 'unknown board' });
+  rmSync(dir, { recursive: true, force: true });
+  res.json({ ok: true });
 });
 
 // Board dataset for rendering: zones (polygons + H values), labels, metadata.

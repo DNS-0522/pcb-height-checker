@@ -238,8 +238,9 @@ def emit_debug(out, view, vb, scale, walls, comp_img, outside_id):
         os.path.join(out, f'debug_walls_{view}.png'))
     rng = np.random.default_rng(3)
     palette = rng.integers(60, 245, (comp_img.max() + 1, 3)).astype(np.uint8)
+    if outside_id:                     # outside_id=0 代表「已用外框封住,沒有外部區」
+        palette[outside_id] = (255, 255, 255)
     palette[0] = (30, 30, 30)          # walls
-    palette[outside_id] = (255, 255, 255)
     Image.fromarray(palette[comp_img]).save(os.path.join(out, f'debug_cc_{view}.png'))
     zones_dbg = []
     for rp in measure.regionprops(comp_img):
@@ -482,14 +483,17 @@ def cmd_extract(args):
         return None, None
 
     segs = {v: [] for v in views}
+    segs_long = {v: [] for v in views}      # 到 20mm:大字標註的筆畫比 8mm 長
     for e in msp:
         bb, ln = seg_bb_len(e)
-        if bb is None or ln is None or ln == 0 or ln > 8.0:
+        if bb is None or ln is None or ln == 0 or ln > 20.0:
             continue
         cx, cy = (bb[0]+bb[2])/2, (bb[1]+bb[3])/2
         for v, vb in views.items():
             if vb[0] <= cx <= vb[2] and vb[1] <= cy <= vb[3]:
-                segs[v].append((bb, ln)); break
+                segs_long[v].append((bb, ln))
+                if ln <= 8.0: segs[v].append((bb, ln))
+                break
 
     def bb_gap(a, b):
         dx = max(0, max(a[0], b[0]) - min(a[2], b[2]))
@@ -605,18 +609,95 @@ def cmd_extract(args):
                        'value': value, 'flagged': value is None})
         return labels[-1]
 
-    n_ok = n_flag = 0
+    rejected = []      # 讀不出任何 H/= 的候選群,合併重讀時還會用到
     for k, c in enumerate(candidates):
         if k % 25 == 0:
             progress(18 + int(30 * k / max(1, len(candidates))), f'讀值 {k}/{len(candidates)}…')
-        r = read_label((c['x0'], c['y0'], c['x1'], c['y1']))
+        box = (c['x0'], c['y0'], c['x1'], c['y1'])
+        r = read_label(box)
         if r is None:
+            rejected.append({'view': c['view'], 'box': box})
             continue
         s, worst, value = r
-        add_label(c['view'], (c['x0'], c['y0'], c['x1'], c['y1']), s, worst, value)
-        if value is None: n_flag += 1
-        else: n_ok += 1
-    progress(50, f'讀值完成:{n_ok} 自動、{n_flag} 待人工')
+        add_label(c['view'], box, s, worst, value)
+
+    # ---- 2b. 字距會隨字體一起放大,但聚類的 gap 是固定 1.2mm,所以大字標註會被
+    # 切成單字元('H' + '=0'),兩半都讀不出值。把讀不出值的標註與相鄰的另一半
+    # (門檻以字高為尺度)合併重讀,只有讀出合法 H 值才取代原本兩筆 —— 兩邊都是
+    # 「待人工」時才合併,已讀出值的標註不會被動到,維持零靜默錯誤。
+    def mergeable(a, b):
+        """a、b 會不會是同一串文字的兩半。圖上有橫排也有轉 90° 的直排標註,
+        所以左右、上下兩個方向都要判(直排的「字高」是 box 寬度)。"""
+        ha, hb = a[3]-a[1], b[3]-b[1]
+        wa, wb = a[2]-a[0], b[2]-b[0]
+        if min(ha, hb) <= 0 or min(wa, wb) <= 0: return False
+        # 左右相鄰(橫排)
+        if max(ha, hb) <= 2.2 * min(ha, hb):
+            if min(a[3], b[3]) - max(a[1], b[1]) >= 0.45 * min(ha, hb):
+                gap = max(a[0], b[0]) - min(a[2], b[2])
+                if -0.3 * max(ha, hb) <= gap <= 0.9 * max(ha, hb): return True
+        # 上下相鄰(直排)
+        if max(wa, wb) <= 2.2 * min(wa, wb):
+            if min(a[2], b[2]) - max(a[0], b[0]) >= 0.45 * min(wa, wb):
+                gap = max(a[1], b[1]) - min(a[3], b[3])
+                if -0.3 * max(wa, wb) <= gap <= 0.9 * max(wa, wb): return True
+        return False
+
+    def hbox(l): return (l['x0'], l['y0'], l['x1'], l['y1'])
+
+    def partner_boxes(l):
+        """在標註左右一個字高的範圍內,用「和字高成比例」的 gap 重新聚類。
+        大字標註的另一半常常根本沒成為候選(筆畫比第一輪長度上限長),所以
+        不能只在既有候選裡找。"""
+        h = l['y1'] - l['y0']; w = l['x1'] - l['x0']
+        if h <= 0 or w <= 0: return []
+        wx0, wx1 = l['x0'] - 1.6*h, l['x1'] + 1.6*h     # 橫排:左右找
+        wy0, wy1 = l['y0'] - 1.6*w, l['y1'] + 1.6*w     # 直排:上下找
+        items = [bb for bb, _ in segs_long[l['view']]
+                 if wx0 <= (bb[0]+bb[2])/2 <= wx1 and wy0 <= (bb[1]+bb[3])/2 <= wy1]
+        out = []
+        for g in cluster(items, max(1.2, 0.35*min(h, w))):
+            if len(g) < 3: continue
+            bx = (min(b[0] for b in g), min(b[1] for b in g),
+                  max(b[2] for b in g), max(b[3] for b in g))
+            if (bx[0] >= l['x0'] - 0.1 and bx[2] <= l['x1'] + 0.1
+                    and bx[1] >= l['y0'] - 0.1 and bx[3] <= l['y1'] + 0.1):
+                continue                       # 就是自己這一半
+            out.append(bx)
+        return out
+
+    n_merged = 0
+    for _ in range(3):
+        grew = False
+        for l in [x for x in labels if x['value'] is None]:
+            if l not in labels: continue
+            others = ([(o, hbox(o)) for o in labels
+                       if o is not l and o['view'] == l['view'] and o['value'] is None]
+                      + [(o, o['box']) for o in rejected if o['view'] == l['view']]
+                      + [(None, b) for b in partner_boxes(l)])
+            others = [(o, b) for o, b in others if mergeable(hbox(l), b)]
+            others.sort(key=lambda ob: (abs((ob[1][0]+ob[1][2])/2 - l['cx'])
+                                        + abs((ob[1][1]+ob[1][3])/2 - l['cy'])))
+            for o, b in others:
+                box = (min(l['x0'], b[0]), min(l['y0'], b[1]),
+                       max(l['x1'], b[2]), max(l['y1'], b[3]))
+                r = read_label(box)
+                if r is None or r[2] is None: continue
+                labels.remove(l)
+                if o is None: pass                      # 直接從線段聚出來的另一半
+                elif o in labels: labels.remove(o)
+                elif o in rejected: rejected.remove(o)
+                add_label(l['view'], box, *r)
+                n_merged += 1
+                grew = True
+                break
+        if not grew: break
+    for i, l in enumerate(labels):      # 移除過會撞號,重新編
+        l['id'] = f'L{i:03d}'
+
+    n_flag = sum(1 for l in labels if l['value'] is None)
+    n_ok = len(labels) - n_flag
+    progress(50, f'讀值完成:{n_ok} 自動、{n_flag} 待人工(合併補回 {n_merged})')
 
     # ---- 3. rasterize views, zone components, associate labels & board comps
     SCALE = 14
@@ -673,105 +754,25 @@ def cmd_extract(args):
         # dilation (which re-closes any <=2px nick the erase leaves in a real line)
         walls = safe_glyph_erase(walls, [l for l in labels if l['view'] == view],
                                  segs_all, msp, vb, SCALE)
-        comp_img = measure.label(~walls, connectivity=1)
+        # 沒有最外框時,任何「漏到圖框邊」的區域都會和外部連成一片而整片消失
+        # (不會成區、裡面的零件也判不到限高)。把使用者框選的視圖外框本身當成
+        # 最外一道牆,這些區域才會各自成區;真正的板外之後用 ghost 判掉。
+        comp_raw = measure.label(~walls, connectivity=1)      # 無外框版:留給對位用
+        border_raw = Counter(list(comp_raw[0, :]) + list(comp_raw[-1, :]) +
+                             list(comp_raw[:, 0]) + list(comp_raw[:, -1]))
+        outside_raw = border_raw.most_common(1)[0][0]
+        walls_f = walls.copy()
+        walls_f[0, :] = walls_f[-1, :] = True
+        walls_f[:, 0] = walls_f[:, -1] = True
+        comp_img = measure.label(~walls_f, connectivity=1)
         comp_area = np.bincount(comp_img.ravel())
         Hpx, Wpx = comp_img.shape
-        border = Counter(list(comp_img[0, :]) + list(comp_img[-1, :]) +
-                         list(comp_img[:, 0]) + list(comp_img[:, -1]))
-        outside_id = border.most_common(1)[0][0]
+        outside_id = 0                                        # 牆=0,已經沒有「外部」區
 
-        def comp_at(x, y):
-            cpx = int(round((x - vb[0]) * SCALE)); rpx = int(round(Hpx - 1 - (y - vb[1]) * SCALE))
-            if 0 <= rpx < Hpx and 0 <= cpx < Wpx:
-                return comp_img[rpx, cpx]
-            return 0
-
-        # label -> zone (tiered sampling)
-        ring = ((-1,0),(1,0),(0,-1),(0,1),(-1,-1),(1,-1),(-1,1),(1,1))
-        used_zones = {}
-        def associate(l):
-            mx = (l['x1']-l['x0'])/2 + 1.0; my = (l['y1']-l['y0'])/2 + 1.0
-            tiers = [[(l['cx'], l['cy'])],
-                     [(l['cx']+dx*mx*0.5, l['cy']+dy*my*0.5) for dx, dy in ring],
-                     [(l['cx']+dx*mx, l['cy']+dy*my) for dx, dy in ring]]
-            zid = None
-            ti_used = None
-            for tier_i, pts in enumerate(tiers):
-                votes = Counter()
-                for x, y in pts:
-                    cid = comp_at(x, y)
-                    if cid and cid != outside_id and comp_area[cid] >= 3*SCALE*SCALE:
-                        votes[cid] += 1
-                if votes:
-                    bestn = max(votes.values())
-                    zid = min((cid for cid, n in votes.items() if n == bestn),
-                              key=lambda cid: comp_area[cid])
-                    ti_used = tier_i
-                    break
-            l['zoneId'] = f'{view}-{zid}' if zid else None
-            l['assocTier'] = ti_used
-            if zid:
-                used_zones.setdefault(zid, [])
-        for l in labels:
-            if l['view'] == view:
-                associate(l)
-
-        n_dbg = emit_debug(out, view, vb, SCALE, walls, comp_img, outside_id)
-        print(f'[debug] {view}: {n_dbg} zones >=10mm2', flush=True)
-
-        # ---- second harvest: a sizable zone with NO label but with text-like
-        # strokes inside means the candidate clustering missed its label
-        # (large banner fonts etc.) — retry inside that zone's bbox, relaxed.
-        labeled_ids = {int(l['zoneId'].split('-')[-1]) for l in labels
-                       if l['view'] == view and l.get('zoneId')}
-        harvested = 0
-        for rp in measure.regionprops(comp_img):
-            zid = rp.label
-            if zid == outside_id or zid in labeled_ids: continue
-            if rp.area < 80 * SCALE * SCALE: continue        # ≥80mm² only
-            r0_, c0_, r1_, c1_ = rp.bbox
-            zx0 = vb[0] + c0_/SCALE; zx1 = vb[0] + c1_/SCALE
-            zy0 = vb[1] + (Hpx-1-r1_)/SCALE; zy1 = vb[1] + (Hpx-1-r0_)/SCALE
-            zone_segs = [(bb, ln) for bb, ln in segs[view]
-                         if zx0-0.5 <= (bb[0]+bb[2])/2 <= zx1+0.5
-                         and zy0-0.5 <= (bb[1]+bb[3])/2 <= zy1+0.5]
-            if len(zone_segs) < 5: continue
-            cands2 = extract_clusters([bb for bb, ln in zone_segs], gap=1.5, min_segs=4)
-            for cd in cands2:
-                if any(cd[0] <= l['x1'] and cd[2] >= l['x0'] and cd[1] <= l['y1'] and cd[3] >= l['y0']
-                       for l in labels if l['view'] == view):
-                    continue
-                r = read_label((cd[0], cd[1], cd[2], cd[3]))
-                if r is None: continue
-                s, worst, value = r
-                l = add_label(view, cd, s, worst, value)
-                associate(l)
-                harvested += 1
-        if harvested:
-            progress(60 if 'TOP' in view else 80, f'{view}:二次搜尋補回 {harvested} 個標註')
-
-        # zone inventory: every zone >=10mm2 PLUS any smaller zone a label
-        # claimed — zones without a value become the user's review queue
-        inventory = set(used_zones)
-        for rp in measure.regionprops(comp_img):
-            if rp.label != outside_id and rp.area >= 10 * SCALE * SCALE:
-                inventory.add(rp.label)
-        for zid in inventory:
-            mask = comp_img == zid
-            padded = np.pad(mask, 1)
-            cs = measure.find_contours(padded.astype(float), 0.5)
-            cs.sort(key=len, reverse=True)
-            poly = []
-            if cs:
-                cont = measure.approximate_polygon(cs[0], tolerance=1.2) - 1
-                poly = [[round(vb[0] + p[1]/SCALE, 2), round(vb[1] + (Hpx-1-p[0])/SCALE, 2)]
-                        for p in cont]
-            zones_out.append({'id': f'{view}-{zid}', 'view': view,
-                              'areaMm2': round(float(mask.sum())/SCALE/SCALE, 1),
-                              'polygon': poly})
-
+        # 對位要用「沒有外框」的版本(板子本體 = 最大的非外部連通塊)。
+        # 對位先做,因為接下來標註歸區、零件歸區都要先知道哪些區其實是板外。
         # ---- registration: fit the STP board contour onto the DXF board blob
-        inside = comp_img != outside_id
+        inside = comp_raw != outside_raw
         blobs = measure.label(inside, connectivity=1)
         areas = np.bincount(blobs.ravel()); areas[0] = 0
         bigb = int(np.argmax(areas))
@@ -817,6 +818,132 @@ def cmd_extract(args):
                           'fitErrMm': fit_err,
                           'dxfBoardOutline': outline, 'stpBoardOutline': stp_outline}
 
+
+        # 加了外框之後,原本屬於「外部」的那一大片(板緣以外 + 板子的 U 形缺口)
+        # 也變成了區。它們不是限高區:原本就在外部、又不在板子本體上的,一律當板外
+        # (ghost)。框得比板子還緊而被切到的板內區域仍然留下 —— 這正是加外框的目的。
+        _tot = np.bincount(comp_img.ravel())
+        _off = np.bincount(comp_img[comp_raw == outside_raw].ravel(), minlength=len(_tot))
+        _onb = np.bincount(comp_img[binary_dilation(maskb, footprint=np.ones((5, 5)))].ravel(),
+                           minlength=len(_tot))
+        ghost = {i_ for i_ in range(1, len(_tot))
+                 if _tot[i_] and _off[i_] > 0.5*_tot[i_] and _onb[i_] < 0.5*_tot[i_]}
+
+
+        def comp_at(x, y):
+            cpx = int(round((x - vb[0]) * SCALE)); rpx = int(round(Hpx - 1 - (y - vb[1]) * SCALE))
+            if 0 <= rpx < Hpx and 0 <= cpx < Wpx:
+                return comp_img[rpx, cpx]
+            return 0
+
+        # label -> zone (tiered sampling)
+        ring = ((-1,0),(1,0),(0,-1),(0,1),(-1,-1),(1,-1),(-1,1),(1,1))
+        used_zones = {}
+        def associate(l):
+            mx = (l['x1']-l['x0'])/2 + 1.0; my = (l['y1']-l['y0'])/2 + 1.0
+            tiers = [[(l['cx'], l['cy'])],
+                     [(l['cx']+dx*mx*0.5, l['cy']+dy*my*0.5) for dx, dy in ring],
+                     [(l['cx']+dx*mx, l['cy']+dy*my) for dx, dy in ring]]
+            zid = None
+            ti_used = None
+            for tier_i, pts in enumerate(tiers):
+                votes = Counter()
+                for x, y in pts:
+                    cid = comp_at(x, y)
+                    if (cid and cid not in ghost
+                            and comp_area[cid] >= 3*SCALE*SCALE):
+                        votes[cid] += 1
+                if votes:
+                    bestn = max(votes.values())
+                    zid = min((cid for cid, n in votes.items() if n == bestn),
+                              key=lambda cid: comp_area[cid])
+                    ti_used = tier_i
+                    break
+            l['zoneId'] = f'{view}-{zid}' if zid else None
+            l['assocTier'] = ti_used
+            if zid:
+                used_zones.setdefault(zid, [])
+        for l in labels:
+            if l['view'] == view:
+                associate(l)
+
+        n_dbg = emit_debug(out, view, vb, SCALE, walls_f, comp_img, outside_id)
+        print(f'[debug] {view}: {n_dbg} zones >=10mm2', flush=True)
+
+        # ---- second harvest: a zone with NO label but with text-like strokes
+        # inside means the candidate clustering missed its label (large banner
+        # fonts, or 'H=0' printed on a screw-hole callout where the circle's
+        # arcs dominate the local cluster) — retry inside that zone's bbox,
+        # relaxed. Small zones only accept a confident read (value != None),
+        # so the review queue doesn't fill up with phantom labels read off
+        # notch geometry.
+        labeled_ids = {int(l['zoneId'].split('-')[-1]) for l in labels
+                       if l['view'] == view and l.get('zoneId')}
+        harvested = 0
+        for rp in measure.regionprops(comp_img):
+            zid = rp.label
+            if zid in ghost or zid in labeled_ids: continue
+            if rp.area < 6 * SCALE * SCALE: continue         # ≥6mm²(螺絲孔註記也算)
+            strict = rp.area < 80 * SCALE * SCALE
+            r0_, c0_, r1_, c1_ = rp.bbox
+            zx0 = vb[0] + c0_/SCALE; zx1 = vb[0] + c1_/SCALE
+            zy0 = vb[1] + (Hpx-1-r1_)/SCALE; zy1 = vb[1] + (Hpx-1-r0_)/SCALE
+            zone_segs = [(bb, ln) for bb, ln in segs[view]
+                         if zx0-0.5 <= (bb[0]+bb[2])/2 <= zx1+0.5
+                         and zy0-0.5 <= (bb[1]+bb[3])/2 <= zy1+0.5]
+            if len(zone_segs) < 5: continue
+            cands2 = extract_clusters([bb for bb, ln in zone_segs], gap=1.5, min_segs=4)
+            for cd in cands2:
+                if any(cd[0] <= l['x1'] and cd[2] >= l['x0'] and cd[1] <= l['y1'] and cd[3] >= l['y0']
+                       for l in labels if l['view'] == view):
+                    continue
+                r = read_label((cd[0], cd[1], cd[2], cd[3]))
+                if r is None: continue
+                s, worst, value = r
+                if strict and value is None: continue
+                l = add_label(view, cd, s, worst, value)
+                associate(l)
+                az = int(l['zoneId'].split('-')[-1]) if l.get('zoneId') else None
+                if az != zid and (az is None or comp_area[az] > 3 * rp.area):
+                    # 我們是為了「這個區沒有標註」才去搜的。螺絲孔註記的字常壓在
+                    # 圓弧上,分層投票會跑到隔壁「大很多」的區,把一整片大區的限高
+                    # 拉成 0 —— 這種情況歸還給正在搜的這個區;投到差不多大小的鄰
+                    # 區則相信投票結果。
+                    l['zoneId'] = f'{view}-{zid}'
+                    l['assocTier'] = -1
+                    used_zones.setdefault(zid, [])
+                harvested += 1
+        if harvested:
+            progress(60 if 'TOP' in view else 80, f'{view}:二次搜尋補回 {harvested} 個標註')
+
+        # zone inventory: every zone >=10mm2 PLUS any smaller zone a label
+        # claimed — zones without a value become the user's review queue.
+        inventory = set(used_zones)
+        for rp in measure.regionprops(comp_img):
+            if rp.label not in ghost and rp.area >= 10 * SCALE * SCALE:
+                inventory.add(rp.label)
+        kept_zones = set()
+        for zid in inventory:
+            mask = comp_img == zid
+            npx = int(mask.sum())
+            if npx == 0 or zid in ghost:
+                continue                      # 板外,不是限高區
+            padded = np.pad(mask, 1)
+            cs = measure.find_contours(padded.astype(float), 0.5)
+            cs.sort(key=len, reverse=True)
+            poly = []
+            if cs:
+                cont = measure.approximate_polygon(cs[0], tolerance=1.2) - 1
+                poly = [[round(vb[0] + p[1]/SCALE, 2), round(vb[1] + (Hpx-1-p[0])/SCALE, 2)]
+                        for p in cont]
+            kept_zones.add(zid)
+            zones_out.append({'id': f'{view}-{zid}', 'view': view,
+                              'areaMm2': round(float(npx)/SCALE/SCALE, 1),
+                              'polygon': poly})
+        for l in labels:                       # 指向被濾掉的區(板外文字)→ 視為未關聯
+            if l['view'] == view and l.get('zoneId') and                     int(l['zoneId'].split('-')[-1]) not in kept_zones:
+                l['zoneId'] = None
+
         # ---- components -> zone membership
         for c in vcomps:
             ex0, ex1 = ((-c['x1'], -c['x0']) if mirror else (c['x0'], c['x1']))
@@ -824,14 +951,14 @@ def cmd_extract(args):
             gy0, gy1 = c['y0'] + ty, c['y1'] + ty
             gcx, gcy = (gx0+gx1)/2, (gy0+gy1)/2
             zid = comp_at(gcx, gcy)
-            if not zid or zid == outside_id:
+            if zid not in kept_zones:
                 for qx, qy in ((gx0+1, gy0+1), (gx1-1, gy0+1), (gx0+1, gy1-1), (gx1-1, gy1-1)):
                     zid = comp_at(qx, qy)
-                    if zid and zid != outside_id: break
+                    if zid in kept_zones: break
             comps_out.append({'id': c['name'], 'footprint': c['part'],
                               'side': side, 'view': view,
                               'h': round(c['h'], 3), 'placeholder': c['ph'],
-                              'zoneId': f'{view}-{zid}' if zid and zid != outside_id else None,
+                              'zoneId': f'{view}-{zid}' if zid in kept_zones else None,
                               'box': [round(gx0, 2), round(gy0, 2), round(gx1, 2), round(gy1, 2)]})
 
     # keep zone polygons also for zones that only components reference
@@ -973,6 +1100,10 @@ def cmd_register(args):
     out = args.out
     meta = json.load(open(os.path.join(out, 'meta.json'), encoding='utf-8'))
     views = meta['views']
+    # 只把零件歸到資料集裡真的存在的區(切區時板外那一圈已被濾掉)
+    zones_path = os.path.join(out, 'zones.json')
+    known_zones = ({z['id'] for z in json.load(open(zones_path, encoding='utf-8'))}
+                   if os.path.exists(zones_path) else set())
     stp = json.load(open(os.path.join(out, 'stp_world.json'), encoding='utf-8'))
     board = next(r for r in stp if r['part'] == 'BOARD_OUTLINE' or r['name'] == 'BOARD_OUTLINE')
     comps_all = [r for r in stp if r['part'] != 'BOARD_OUTLINE' and r['name'] != 'BOARD_OUTLINE']
@@ -1023,12 +1154,17 @@ def cmd_register(args):
                                      segs_all, msp, vb, SCALE)
         else:
             walls = binary_dilation(walls, footprint=np.ones((3, 3)))
-        comp_img = measure.label(~walls, connectivity=1)
-        Hpx, Wpx = comp_img.shape
-        border = Counter(list(comp_img[0, :]) + list(comp_img[-1, :]) +
-                         list(comp_img[:, 0]) + list(comp_img[:, -1]))
-        outside_id = border.most_common(1)[0][0]
-        inside = comp_img != outside_id
+        # 和 cmd_extract 用同一套切區(視圖外框當最外一道牆),區號才對得上
+        comp_raw = measure.label(~walls, connectivity=1)
+        Hpx, Wpx = comp_raw.shape
+        border = Counter(list(comp_raw[0, :]) + list(comp_raw[-1, :]) +
+                         list(comp_raw[:, 0]) + list(comp_raw[:, -1]))
+        outside_raw = border.most_common(1)[0][0]
+        walls_f = walls.copy()
+        walls_f[0, :] = walls_f[-1, :] = True
+        walls_f[:, 0] = walls_f[:, -1] = True
+        comp_img = measure.label(~walls_f, connectivity=1)
+        inside = comp_raw != outside_raw
         blobs = measure.label(inside, connectivity=1)
         areas = np.bincount(blobs.ravel()); areas[0] = 0
         maskb = blobs == int(np.argmax(areas))
@@ -1073,15 +1209,17 @@ def cmd_register(args):
             gx0, gx1 = ex0 + tx, ex1 + tx
             gy0, gy1 = c['y0'] + ty, c['y1'] + ty
             gcx, gcy = (gx0+gx1)/2, (gy0+gy1)/2
+            def zone_ok(z):   # 舊資料集沒有 zones.json 時退回「非牆即可」
+                return f'{view}-{z}' in known_zones if known_zones else bool(z)
             zid = comp_at(gcx, gcy)
-            if not zid or zid == outside_id:
+            if not zone_ok(zid):
                 for qx, qy in ((gx0+1, gy0+1), (gx1-1, gy0+1), (gx0+1, gy1-1), (gx1-1, gy1-1)):
                     zid = comp_at(qx, qy)
-                    if zid and zid != outside_id: break
+                    if zone_ok(zid): break
             comps_out.append({'id': c['name'], 'footprint': c['part'],
                               'side': side, 'view': view,
                               'h': round(c['h'], 3), 'placeholder': c['ph'],
-                              'zoneId': f'{view}-{zid}' if zid and zid != outside_id else None,
+                              'zoneId': f'{view}-{zid}' if zone_ok(zid) else None,
                               'box': [round(gx0, 2), round(gy0, 2), round(gx1, 2), round(gy1, 2)]})
 
     meta['registration'] = {**meta_reg, 'accuracyMm': max(
@@ -1110,11 +1248,90 @@ def cmd_diff(args):
     for i, path in enumerate([args.dxf, args.dxf_b]):
         progress(3 + i * 4, f'讀取{"舊版" if i == 0 else "新版"} DXF…')
         docs.append(ezdxf.readfile(path))
+    # ---- 對位:兩版的圖紙座標常常在建圖過程中跑掉(整體平移),不先對上
+    # 的話每條線都會變成紅+綠雙線(3 px/mm 下只要偏 >0.33mm 就全圖亮)。
+    # 位移用孔位投票的「多數共識」估,改動區只投散票 → 不會把位移帶偏;
+    # 共識比例就是可信度,太低就不套用(寧可不對位,也不要對錯)。
+    import diff_align as dal
+    align = {'applied': False, 'dx': 0.0, 'dy': 0.0, 'consensusPct': None,
+             'crossCheckMm': None, 'reason': None}
+    if args.align_dx is not None or args.align_dy is not None:      # 手動指定
+        align.update(applied=True, dx=args.align_dx or 0.0, dy=args.align_dy or 0.0,
+                     reason='manual')
+        print(f'[align] 手動位移 ({align["dx"]:+.3f}, {align["dy"]:+.3f}) mm', flush=True)
+    elif args.no_align:
+        align['reason'] = 'disabled'
+        print('[align] 已停用自動對位', flush=True)
+    else:
+        progress(9, '估計兩版位移…')
+        est = dal.estimate(docs[0], docs[1])
+        if est is None:
+            align['reason'] = 'no_features'
+            print('[align] 找不到可配對的特徵,不對位', flush=True)
+        else:
+            dx, dy, pct, out, gap = est
+            align.update(dx=round(dx, 3), dy=round(dy, 3), consensusPct=round(pct, 1),
+                         crossCheckMm=None if gap is None else round(gap, 3),
+                         outliers=len(out))
+            trustworthy = pct >= 95.0 and (gap is None or gap < 0.1)
+            zero = abs(dx) < 1e-6 and abs(dy) < 1e-6
+            if trustworthy:
+                # 位移為 0 且共識高 = 兩版本來就對齊,不必動
+                align['reason'] = 'already_aligned' if zero else 'auto'
+                align['applied'] = not zero
+            else:
+                align['reason'] = 'low_consensus'
+            print(f'[align] 位移 ({dx:+.3f}, {dy:+.3f}) mm、共識 {pct:.1f}%'
+                  f'、交叉驗證差 {gap if gap is None else round(gap, 3)} mm'
+                  f' → {"套用" if align["applied"] else "不套用(" + align["reason"] + ")"}',
+                  flush=True)
+            # 共識低 = 圖面上可能存在「不只一個位移」(某個視圖被搬動)或局部大改。
+            # 分區各估一次告訴使用者是哪一種 —— 只報告,不自動套用:分區各自對位
+            # 等於把「被改動的部分」也對齊掉,真實差異就會消失。
+            if not trustworthy:
+                progress(10, '共識不足,檢查是否有多個位移…')
+                models = dal.estimate_multi(docs[0], docs[1])
+                align['models'] = models
+                for m in models:
+                    bb = m['bbox']
+                    print(f'[align]   位移 ({m["dx"]:+.3f}, {m["dy"]:+.3f}) mm:'
+                          f'{m["features"]} 個特徵({m["pct"]:.1f}%),'
+                          f'分布 ({bb[0]}, {bb[1]})–({bb[2]}, {bb[3]}) mm', flush=True)
+                # 有具名的視圖框就順便給各視圖的數字(比較好懂)
+                if args.views and os.path.exists(args.views):
+                    try:
+                        vv = json.load(open(args.views, encoding='utf-8'))
+                        regions = dal.estimate_regions(
+                            docs[0], docs[1], [(k, v[0], v[1], v[2], v[3]) for k, v in vv.items()])
+                        align['regions'] = regions
+                        for r in regions:
+                            print(f'[align]   {r["name"]}: ({r["dx"]:+.3f}, {r["dy"]:+.3f}) mm '
+                                  f'共識 {r["consensusPct"]:.1f}% ({r["features"]} 個特徵)', flush=True)
+                    except Exception:
+                        pass
+                moved = [m for m in models if abs(m['dx']) > 1e-6 or abs(m['dy']) > 1e-6]
+                if len(models) > 1 and moved:
+                    m = moved[0]; bb = m['bbox']
+                    align['hint'] = (f'圖面上有多個位移:主要區域對齊,另有 {m["pct"]:.0f}% 的特徵'
+                                     f'整體位移 ({m["dx"]:+.3f}, {m["dy"]:+.3f}) mm,'
+                                     f'分布在 ({bb[0]}, {bb[1]})–({bb[2]}, {bb[3]}) mm'
+                                     f' —— 可能是這一塊被搬動了,可用這個位移重新比對')
+                    align['suggest'] = {'dx': m['dx'], 'dy': m['dy'], 'bbox': bb}
+                elif models:
+                    align['hint'] = (f'只有 {models[0]["pct"]:.0f}% 的特徵對得上,'
+                                     f'其餘可能真的改了;必要時手動指定位移')
+                else:
+                    align['hint'] = '找不到一致的位移,建議手動指定'
+                print(f'[align] {align["hint"]}', flush=True)
+
     xs, ys = [], []
-    for doc in docs:
+    for i, doc in enumerate(docs):
+        sx = align['dx'] if (i == 1 and align['applied']) else 0.0
+        sy = align['dy'] if (i == 1 and align['applied']) else 0.0
         for e in doc.modelspace():
             if e.dxftype() == 'LINE':
-                xs += [e.dxf.start.x, e.dxf.end.x]; ys += [e.dxf.start.y, e.dxf.end.y]
+                xs += [e.dxf.start.x - sx, e.dxf.end.x - sx]
+                ys += [e.dxf.start.y - sy, e.dxf.end.y - sy]
     if not xs:
         print('ERROR 兩個 DXF 都沒有 LINE 實體,無法決定圖面範圍', flush=True)
         sys.exit(2)
@@ -1130,7 +1347,10 @@ def cmd_diff(args):
         ax = fig.add_axes([0, 0, 1, 1]); ax.set_facecolor('white')
         Frontend(RenderContext(doc), MatplotlibBackend(ax), config=cfg).draw_layout(
             doc.modelspace(), finalize=False)
-        ax.set_xlim(x0, x1); ax.set_ylim(y0, y1); ax.set_aspect('equal'); ax.axis('off')
+        sx = align['dx'] if (i == 1 and align['applied']) else 0.0
+        sy = align['dy'] if (i == 1 and align['applied']) else 0.0
+        ax.set_xlim(x0 + sx, x1 + sx); ax.set_ylim(y0 + sy, y1 + sy)
+        ax.set_aspect('equal'); ax.axis('off')
         fig.canvas.draw()
         buf = np.asarray(fig.canvas.buffer_rgba())[:, :, :3]
         walls.append(buf.mean(axis=2) < 128)
@@ -1167,7 +1387,7 @@ def cmd_diff(args):
         })
     regions.sort(key=lambda r: -(r['removedPx'] + r['addedPx']))
     json.dump({'x0': round(x0, 2), 'y0': round(y0, 2), 'x1': round(x1, 2), 'y1': round(y1, 2),
-               'pxw': Wpx, 'pxh': Hpx,
+               'pxw': Wpx, 'pxh': Hpx, 'align': align,
                'removedPx': int(only_a.sum()), 'addedPx': int(only_b.sum()),
                'regions': regions[:300], 'regionsTotal': len(regions)},
               open(os.path.join(args.out, 'diff.json'), 'w'))
@@ -1194,21 +1414,22 @@ def cmd_diffzoom(args):
         sys.exit(2)
     m = 5.0  # filter margin, mm (covers strokes crossing the window edge)
 
-    def rough_hit(e):
+    def rough_hit(e, sx=0.0, sy=0.0):
         t = e.dxftype()
+        wx0, wx1, wy0, wy1 = x0+sx-m, x1+sx+m, y0+sy-m, y1+sy+m
         try:
             if t == 'LINE':
                 a, b = e.dxf.start, e.dxf.end
-                return not (max(a.x, b.x) < x0-m or min(a.x, b.x) > x1+m
-                            or max(a.y, b.y) < y0-m or min(a.y, b.y) > y1+m)
+                return not (max(a.x, b.x) < wx0 or min(a.x, b.x) > wx1
+                            or max(a.y, b.y) < wy0 or min(a.y, b.y) > wy1)
             if t in ('CIRCLE', 'ARC'):
                 c, r = e.dxf.center, e.dxf.radius
-                return not (c.x+r < x0-m or c.x-r > x1+m or c.y+r < y0-m or c.y-r > y1+m)
+                return not (c.x+r < wx0 or c.x-r > wx1 or c.y+r < wy0 or c.y-r > wy1)
             if t == 'LWPOLYLINE':
                 pts = [(p[0], p[1]) for p in e.get_points()]
                 xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
-                return not (max(xs) < x0-m or min(xs) > x1+m
-                            or max(ys) < y0-m or min(ys) > y1+m)
+                return not (max(xs) < wx0 or min(xs) > wx1
+                            or max(ys) < wy0 or min(ys) > wy1)
         except Exception:
             return True
         return True   # unknown types: keep (rare; correctness over speed)
@@ -1217,14 +1438,20 @@ def cmd_diffzoom(args):
     cfg = Configuration(background_policy=BackgroundPolicy.WHITE, color_policy=ColorPolicy.BLACK)
     dpi = 100
     walls = []
+    # 整張圖套了對位位移的話,放大也要套同一個,否則兩邊看起來會不一致
+    adx = args.align_dx or 0.0
+    ady = args.align_dy or 0.0
     for i, path in enumerate([args.dxf, args.dxf_b]):
         progress(5 + i * 45, f'渲染{"舊版" if i == 0 else "新版"}區塊…')
+        sx = adx if i == 1 else 0.0
+        sy = ady if i == 1 else 0.0
         doc = ezdxf.readfile(path)
-        ents = [e for e in doc.modelspace() if rough_hit(e)]
+        ents = [e for e in doc.modelspace() if rough_hit(e, sx, sy)]
         fig = plt.figure(figsize=((x1-x0)*SCALE/dpi, (y1-y0)*SCALE/dpi), dpi=dpi)
         ax = fig.add_axes([0, 0, 1, 1]); ax.set_facecolor('white')
         Frontend(RenderContext(doc), MatplotlibBackend(ax), config=cfg).draw_entities(ents)
-        ax.set_xlim(x0, x1); ax.set_ylim(y0, y1); ax.set_aspect('equal'); ax.axis('off')
+        ax.set_xlim(x0 + sx, x1 + sx); ax.set_ylim(y0 + sy, y1 + sy)
+        ax.set_aspect('equal'); ax.axis('off')
         fig.canvas.draw()
         buf = np.asarray(fig.canvas.buffer_rgba())[:, :, :3]
         walls.append(buf.mean(axis=2) < 128)
@@ -1244,7 +1471,8 @@ def cmd_diffzoom(args):
     img[both] = (148, 155, 164)
     img[only_a] = (225, 29, 72)
     img[only_b] = (22, 163, 74)
-    name = f'zoom_{x0:.1f}_{y0:.1f}_{x1:.1f}_{y1:.1f}.jpg'
+    tag = '' if (adx == 0 and ady == 0) else f'_a{adx:+.2f}{ady:+.2f}'
+    name = f'zoom_{x0:.1f}_{y0:.1f}_{x1:.1f}_{y1:.1f}{tag}.jpg'
     Image.fromarray(img).save(os.path.join(args.out, name), 'JPEG', quality=85)
     print(f'ZOOM {name}', flush=True)
     progress(100, '區塊放大完成')
@@ -1424,7 +1652,6 @@ def cmd_debugviz(args):
     from ezdxf.addons.drawing.config import Configuration, BackgroundPolicy, ColorPolicy
     from skimage import measure
     from skimage.morphology import binary_dilation
-    from collections import Counter
 
     out = args.out
     meta = json.load(open(os.path.join(out, 'meta.json'), encoding='utf-8'))
@@ -1455,11 +1682,11 @@ def cmd_debugviz(args):
                                      segs_all, msp, vb, SCALE)
         else:
             walls = binary_dilation(walls, footprint=np.ones((3, 3)))
+        # 和 cmd_extract 同一套切區(視圖外框當最外一道牆),區號才和 zones.json 對得上
+        walls[0, :] = walls[-1, :] = True
+        walls[:, 0] = walls[:, -1] = True
         comp_img = measure.label(~walls, connectivity=1)
-        border = Counter(list(comp_img[0, :]) + list(comp_img[-1, :]) +
-                         list(comp_img[:, 0]) + list(comp_img[:, -1]))
-        outside_id = border.most_common(1)[0][0]
-        n = emit_debug(out, view, vb, SCALE, walls, comp_img, outside_id)
+        n = emit_debug(out, view, vb, SCALE, walls, comp_img, 0)
         print(f'[debug] {view}: {n} zones', flush=True)
     progress(100, 'debugviz 完成')
 
@@ -1469,6 +1696,8 @@ def main():
     ap.add_argument('--dxf'); ap.add_argument('--dxf-b'); ap.add_argument('--stp')
     ap.add_argument('--views'); ap.add_argument('--out', required=True)
     ap.add_argument('--region')  # diffzoom: "x0,y0,x1,y1" in sheet mm
+    ap.add_argument('--no-align', action='store_true')       # diff: 停用自動對位
+    ap.add_argument('--align-dx', type=float); ap.add_argument('--align-dy', type=float)
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
     {'overview': cmd_overview, 'stp': cmd_stp, 'extract': cmd_extract,

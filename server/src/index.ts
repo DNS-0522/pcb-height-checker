@@ -5,6 +5,8 @@ import { heightCheckRouter } from './heightcheck';
 import { analyzeRouter } from './analyze';
 import { dxfDiffRouter } from './dxfdiff';
 import { cloudRouter } from './cloud';
+import { reportRouter } from './report';
+import { transferRouter } from './transfer';
 
 const app = express();
 // Note: do NOT read process.env.PORT — the preview panel injects PORT=<client
@@ -21,6 +23,8 @@ app.get('/api/health', (_req, res) => {
 
 app.use('/api/stp', stpRouter);
 app.use('/api/heightcheck', heightCheckRouter);
+app.use('/api/heightcheck', reportRouter);
+app.use('/api/heightcheck', transferRouter);
 app.use('/api/analyze', analyzeRouter);
 app.use('/api/dxfdiff', dxfDiffRouter);
 app.use('/api/cloud', cloudRouter);

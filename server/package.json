@@ -10,7 +10,9 @@
   "dependencies": {
     "@azure/msal-node": "^5.6.0",
     "cors": "^2.8.5",
+    "exceljs": "^4.4.0",
     "express": "^4.21.2",
+    "jszip": "^3.10.1",
     "multer": "^2.2.0",
     "occt-import-js": "^0.0.23"
   },

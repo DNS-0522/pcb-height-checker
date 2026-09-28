@@ -8,9 +8,13 @@ import {
   Search,
   Info,
   FileUp,
-  PenLine,
   RefreshCw,
   X,
+  Download,
+  Keyboard,
+  FolderDown,
+  FolderUp,
+  Loader2 as Spinner,
 } from 'lucide-react';
 import { cn, fmt } from './lib/utils';
 import UploadWizard from './UploadWizard';
@@ -101,6 +105,12 @@ interface BoardInfo {
   id: string;
   title: string;
   source: 'builtin' | 'upload';
+  note?: string | null;
+  extractedAt?: string | null;
+  dxf?: string | null;
+  stp?: string | null;
+  /** 資料集留有 input.dxf,才能更換 DXF / STP 重跑 */
+  hasCad?: boolean;
 }
 
 /** replace-dxf 的沿用報告(carryover.json) */
@@ -137,6 +147,7 @@ export default function HeightCheck() {
   const [boards, setBoards] = useState<BoardInfo[]>([]);
   const [boardId, setBoardId] = useState<string | null>(null);
   const [showWizard, setShowWizard] = useState(false);
+  const [showManager, setShowManager] = useState(false);
   const [replaceTarget, setReplaceTarget] = useState<{ mode: 'stp' | 'dxf'; id: string; title: string } | null>(null);
   const [carryover, setCarryover] = useState<Carryover | null>(null);
   const [meta, setMeta] = useState<Meta | null>(null);
@@ -163,9 +174,11 @@ export default function HeightCheck() {
   const [hover, setHover] = useState<{ x: number; y: number; lines: string[] } | null>(null);
   const [showBackdrop, setShowBackdrop] = useState(true);
   const [showAlign, setShowAlign] = useState(true);
-  const [focusLabel, setFocusLabel] = useState<string | null>(null);
   const [locateZone, setLocateZone] = useState<Zone | null>(null);
   const [editZoneId, setEditZoneId] = useState<string | null>(null);
+  /** 內嵌複查面板:目前顯示第幾個待確認區、本次已填數 */
+  const [reviewIdx, setReviewIdx] = useState(0);
+  const [reviewFilled, setReviewFilled] = useState(0);
   const boardRef = useRef<HTMLElement | null>(null);
   const [mode, setMode] = useState<'result' | 'debug'>('result');
   const [debugBase, setDebugBase] = useState<'draw' | 'walls' | 'cc'>('cc');
@@ -183,6 +196,7 @@ export default function HeightCheck() {
   }, [locateZone, editZoneId]);
 
   useEffect(() => { setEditZoneId(null); }, [boardId, view]);
+  useEffect(() => { setReviewIdx(0); setReviewFilled(0); }, [boardId]);
 
   const refreshBoards = useCallback(async (): Promise<BoardInfo[]> => {
     const res = await fetch('/api/heightcheck/boards');
@@ -320,7 +334,7 @@ export default function HeightCheck() {
           <FileUp className="w-4 h-4" />
           <span>上傳新板卡</span>
         </button>
-        {boards.find((b) => b.id === boardId)?.source === 'upload' && (
+        {(() => { const b = boards.find((x) => x.id === boardId); return b?.source === 'upload' && b.hasCad; })() && (
           <>
             {([['stp', '更換 STP', '沿用此板卡的 DXF 標註成果,只更換 3D 模型'],
                ['dxf', '更換 DXF', '沿用 STP 與未變區域的人工判定,只更換圖面']] as const).map(([mode, label, title]) => (
@@ -341,7 +355,35 @@ export default function HeightCheck() {
             ))}
           </>
         )}
+        <button
+          onClick={() => setShowManager(true)}
+          className="px-4 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:border-blue-500 hover:text-blue-600 dark:hover:text-blue-400 text-sm font-medium flex items-center space-x-2 cursor-pointer"
+          title="改名、加備註、刪除板卡"
+        >
+          <SlidersHorizontal className="w-4 h-4" />
+          <span>管理板卡</span>
+        </button>
+        <DatasetTransfer
+          boardId={boardId}
+          onImported={async (id) => { await refreshBoards(); setBoardId(id); }}
+        />
+        {boards.find((b) => b.id === boardId)?.note && (
+          <span className="text-xs text-slate-400 max-w-xs truncate" title={boards.find((b) => b.id === boardId)!.note!}>
+            {boards.find((b) => b.id === boardId)!.note}
+          </span>
+        )}
       </section>
+
+      {showManager && (
+        <BoardManager
+          boards={boards}
+          onClose={() => setShowManager(false)}
+          onChanged={async (deletedId) => {
+            const list = await refreshBoards();
+            if (deletedId && deletedId === boardId) setBoardId(list[0]?.id ?? null);
+          }}
+        />
+      )}
 
       {showWizard && (
         <UploadWizard
@@ -385,33 +427,22 @@ export default function HeightCheck() {
         </section>
       )}
 
-      {/* review queue: every numbered zone that still has no H value */}
+      {/* review queue: every numbered zone that still has no H value,
+          shown inline one at a time — keyboard-first */}
       {pendingZones.length > 0 && (
-        <section className="border border-amber-300 dark:border-amber-800 bg-white dark:bg-slate-950 rounded-xl p-4 shadow-sm">
-          <h3 className="text-sm font-semibold mb-1 flex items-center space-x-2">
-            <PenLine className="w-4 h-4 text-amber-500" />
-            <span>待確認區({pendingZones.length})</span>
-          </h3>
-          <p className="text-xs text-slate-400 mb-3">
-            這些編號區還沒有限高值(自動讀值沒讀到,或圖面沒標)。給值、或按「無限制」跳過;
-            區內若有讀不出的標註會附小圖當提示。依面積大到小排列。
-          </p>
-          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
-            {pendingZones.map((z) => (
-              <PendingZoneCard
-                key={z.id}
-                zone={z}
-                hints={labels.filter((l) => l.zoneId === z.id && l.flagged)}
-                focused={focusLabel === z.id}
-                outline={meta.registration[z.view]?.dxfBoardOutline}
-                viewBox={meta.views[z.view]}
-                suggest={carryover?.review.find((r) => r.zoneId === z.id)?.oldValue}
-                onSave={saveZone}
-                onLocate={() => setLocateZone(z)}
-              />
-            ))}
-          </div>
-        </section>
+        <ReviewPanel
+          pendingZones={pendingZones}
+          idx={reviewIdx}
+          onIdx={setReviewIdx}
+          filledCount={reviewFilled}
+          labels={labels}
+          meta={meta}
+          carryover={carryover}
+          onSave={async (zoneId, v) => {
+            await saveZone(zoneId, v);
+            setReviewFilled((n) => n + 1);
+          }}
+        />
       )}
 
       {/* stats + rules */}
@@ -441,6 +472,20 @@ export default function HeightCheck() {
           <SlidersHorizontal className="w-4 h-4 text-slate-500" />
           <span>判定規則</span>
           <span className="text-xs font-normal text-slate-400">改動即重新判定(H=0 語義 = 待決策 6)</span>
+          <a
+            href={`/api/heightcheck/report/${boardId}?${new URLSearchParams({
+              toleranceMm: String(rules.toleranceMm),
+              keepoutMode: rules.keepoutMode,
+              keepoutThresholdMm: String(rules.keepoutThresholdMm),
+              placeholderMode: rules.placeholderMode,
+            })}`}
+            download
+            className="ml-auto inline-flex items-center gap-1.5 rounded-lg border border-slate-300 dark:border-slate-700 px-2.5 py-1 text-xs font-medium text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
+            title="以目前規則匯出 Excel 報告(總覽/違規清單/H=0 區/區域 H 值/全部元件/板面圖)"
+          >
+            <Download className="w-3.5 h-3.5" />
+            <span>匯出報告</span>
+          </a>
         </h3>
         <div className="flex flex-wrap items-center gap-x-6 gap-y-3 text-sm">
           <label className="flex items-center space-x-2">
@@ -733,8 +778,9 @@ export default function HeightCheck() {
                   onClick={
                     pending
                       ? () => {
-                          setFocusLabel(z.id);
-                          document.getElementById(`pending-${z.id}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                          const i = pendingZones.findIndex((x) => x.id === z.id);
+                          setReviewIdx(Math.max(i, 0));
+                          document.getElementById('review-panel')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
                         }
                       : () => setEditZoneId(editZoneId === z.id ? null : z.id)
                   }
@@ -839,27 +885,6 @@ export default function HeightCheck() {
                     </text>
                   );
                 })}
-            {mode === 'result' && focusLabel && (() => {
-              const z = viewZones.find((x) => x.id === focusLabel);
-              if (!z || !z.polygon.length) return null;
-              const cx = z.polygon.reduce((s, p) => s + p[0], 0) / z.polygon.length;
-              const cy = z.polygon.reduce((s, p) => s + p[1], 0) / z.polygon.length;
-              return (
-                <g pointerEvents="none">
-                  <polygon
-                    points={z.polygon.map(([x, y]) => `${x},${-y}`).join(' ')}
-                    fill="none"
-                    stroke="#f59e0b"
-                    strokeWidth={1.2}
-                  >
-                    <animate attributeName="stroke-opacity" values="1;0.25;1" dur="1.4s" repeatCount="indefinite" />
-                  </polygon>
-                  <circle cx={cx} cy={-cy} r={7} fill="none" stroke="#f59e0b" strokeWidth={1}>
-                    <animate attributeName="r" values="5;9;5" dur="1.6s" repeatCount="indefinite" />
-                  </circle>
-                </g>
-              );
-            })()}
           </svg>
           {hover && (
             <div
@@ -1100,106 +1125,166 @@ export default function HeightCheck() {
   );
 }
 
-function PendingZoneCard({
-  zone,
-  hints,
-  focused,
-  outline,
-  viewBox,
-  suggest,
+/** 內嵌鍵盤複查面板:一次一區,數字+Enter 存檔即自動顯示下一區。 */
+function ReviewPanel({
+  pendingZones,
+  idx,
+  onIdx,
+  filledCount,
+  labels,
+  meta,
+  carryover,
   onSave,
-  onLocate,
 }: {
-  zone: Zone;
-  hints: HLabel[];
-  focused: boolean;
-  outline?: [number, number][];
-  viewBox?: [number, number, number, number];
-  /** replace-dxf:此區上一版的判定值(圖面有變,套用前請確認) */
-  suggest?: number | 'nolimit';
-  onSave: (zoneId: string, value: number | 'nolimit' | null) => Promise<void> | void;
-  onLocate: () => void;
+  pendingZones: Zone[];
+  idx: number;
+  onIdx: (i: number) => void;
+  filledCount: number;
+  labels: HLabel[];
+  meta: Meta;
+  carryover: Carryover | null;
+  onSave: (zoneId: string, value: number | 'nolimit') => Promise<void> | void;
 }) {
   const [val, setVal] = useState('');
   const [saving, setSaving] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+
+  const cur = Math.max(0, Math.min(idx, pendingZones.length - 1));
+  const zone = pendingZones[cur];
+  const suggest = carryover?.review.find((r) => r.zoneId === zone.id)?.oldValue;
+  const hints = labels.filter((l) => l.zoneId === zone.id && l.flagged);
+
+  /** 存檔後要把焦點還給輸入框(要等下一區 render 完、input 不再 disabled) */
+  const focusNext = useRef(false);
   useEffect(() => {
-    if (focused) inputRef.current?.focus({ preventScroll: true });
-  }, [focused]);
-  const hint = hints[0];
-  const hl = hint?.cropBox && (() => {
-    const cb = hint.cropBox!;
-    const cw = cb[2] - cb[0];
-    const ch = cb[3] - cb[1];
-    if (cw <= 0 || ch <= 0) return null;
-    return {
-      left: `${((hint.x0 - cb[0]) / cw) * 100}%`,
-      width: `${((hint.x1 - hint.x0) / cw) * 100}%`,
-      top: `${((cb[3] - hint.y1) / ch) * 100}%`,
-      height: `${((hint.y1 - hint.y0) / ch) * 100}%`,
-    };
-  })();
+    setVal('');
+    if (focusNext.current) {
+      focusNext.current = false;
+      inputRef.current?.focus({ preventScroll: true });
+    }
+  }, [zone.id]);
+
+  const doSave = async (v: number | 'nolimit') => {
+    if (saving) return;
+    setSaving(true);
+    focusNext.current = true;
+    // 存檔後這一區離開 pending 清單,同一個索引自然輪到下一區
+    try { await onSave(zone.id, v); } finally { setSaving(false); }
+  };
+
+  const onKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter') {
+      const n = Number(val);
+      if (val !== '' && Number.isFinite(n) && n >= 0 && n <= 50) {
+        e.preventDefault();
+        void doSave(n);
+      }
+    } else if (e.key === 'n' || e.key === 'N') {
+      e.preventDefault(); void doSave('nolimit');
+    } else if ((e.key === 's' || e.key === 'S') && suggest !== undefined) {
+      e.preventDefault(); void doSave(suggest);
+    } else if (e.key === 'ArrowDown' || e.key === 'Tab') {
+      e.preventDefault(); onIdx((cur + 1) % pendingZones.length);
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault(); onIdx((cur - 1 + pendingZones.length) % pendingZones.length);
+    }
+  };
+
+  const outline = meta.registration[zone.view]?.dxfBoardOutline;
+  const viewBox = meta.views[zone.view];
+
   return (
-    <div
-      id={`pending-${zone.id}`}
-      className={cn(
-        'rounded-lg border p-2 space-y-2',
-        focused
-          ? 'border-amber-400 ring-2 ring-amber-300 dark:ring-amber-700'
-          : 'border-slate-200 dark:border-slate-800',
-      )}
+    <section
+      id="review-panel"
+      className="border border-amber-300 dark:border-amber-800 bg-white dark:bg-slate-950 rounded-xl p-4 shadow-sm space-y-3"
+      onKeyDown={onKeyDown}
+      onClick={() => inputRef.current?.focus({ preventScroll: true })}
     >
-      <div className="flex items-center justify-between">
-        <span className="text-sm font-bold text-amber-600 dark:text-amber-400">{zone.num}</span>
-        <span className="text-[11px] text-slate-400 font-mono">
+      <div className="flex items-center gap-3">
+        <h3 className="text-sm font-semibold flex items-center space-x-2">
+          <Keyboard className="w-4 h-4 text-amber-500" />
+          <span>待確認區</span>
+        </h3>
+        <span className="text-xs text-slate-400 font-mono">
+          {cur + 1} / {pendingZones.length} · 本次已填 {filledCount}
+        </span>
+        <div className="ml-auto flex items-center gap-1">
+          <button
+            onClick={(e) => { e.stopPropagation(); onIdx((cur - 1 + pendingZones.length) % pendingZones.length); inputRef.current?.focus({ preventScroll: true }); }}
+            className="rounded border border-slate-300 dark:border-slate-700 px-2 py-0.5 text-xs text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800 cursor-pointer"
+            title="上一區(↑)"
+          >↑</button>
+          <button
+            onClick={(e) => { e.stopPropagation(); onIdx((cur + 1) % pendingZones.length); inputRef.current?.focus({ preventScroll: true }); }}
+            className="rounded border border-slate-300 dark:border-slate-700 px-2 py-0.5 text-xs text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800 cursor-pointer"
+            title="跳過,下一區(↓/Tab)"
+          >↓</button>
+        </div>
+      </div>
+      <div className="h-1 rounded bg-slate-100 dark:bg-slate-800 overflow-hidden">
+        <div
+          className="h-full bg-amber-500 transition-all"
+          style={{ width: `${(filledCount / Math.max(filledCount + pendingZones.length, 1)) * 100}%` }}
+        />
+      </div>
+
+      <div className="flex items-center gap-3">
+        <span className="text-lg font-bold text-amber-600 dark:text-amber-400">{zone.num}</span>
+        <span className="text-xs text-slate-400 font-mono">
           {zone.view === 'TOP_LIMIT' ? '頂面' : '底面'} · {fmt(zone.areaMm2 ?? undefined, 0)} mm²
         </span>
       </div>
-      <button
-        onClick={onLocate}
-        title="在主板圖上定位這個區"
-        className="w-full rounded border border-slate-200 dark:border-slate-700 hover:border-amber-400 cursor-pointer bg-white dark:bg-slate-900 p-0.5"
-      >
-        {outline && viewBox ? (
-          <svg
-            viewBox={`${viewBox[0]} ${-viewBox[3]} ${viewBox[2] - viewBox[0]} ${viewBox[3] - viewBox[1]}`}
-            className="w-full h-12"
-          >
-            <polygon
-              points={outline.map(([x, y]) => `${x},${-y}`).join(' ')}
-              fill="#cbd5e1"
-              fillOpacity={0.6}
-              stroke="#64748b"
-              strokeWidth={0.8}
-            />
-            <polygon
-              points={zone.polygon.map(([x, y]) => `${x},${-y}`).join(' ')}
-              fill="#dc2626"
-              fillOpacity={0.85}
-              stroke="#dc2626"
-              strokeWidth={1.5}
-            />
-          </svg>
-        ) : (
-          <span className="text-[11px] text-slate-400">定位</span>
-        )}
-      </button>
-      {hint?.crop && (
-        <div className="relative">
-          <img src={hint.crop} alt={hint.id} className="w-full h-auto rounded bg-white" />
-          {hl && (
-            <div
-              className="absolute rounded-sm bg-amber-300/25 border border-amber-400/80 pointer-events-none"
-              style={hl}
-            />
-          )}
-          <div className="text-[10px] text-slate-400 mt-0.5">
-            區內讀不出的標註(機器猜「{hint.read || '?'}」)
-          </div>
+
+      <div className="grid grid-cols-2 gap-3">
+        <div className="rounded border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 p-1">
+          {outline && viewBox ? (
+            <svg
+              viewBox={`${viewBox[0]} ${-viewBox[3]} ${viewBox[2] - viewBox[0]} ${viewBox[3] - viewBox[1]}`}
+              className="w-full h-32"
+            >
+              <polygon
+                points={outline.map(([x, y]) => `${x},${-y}`).join(' ')}
+                fill="#cbd5e1" fillOpacity={0.6} stroke="#64748b" strokeWidth={0.8}
+              />
+              <polygon
+                points={zone.polygon.map(([x, y]) => `${x},${-y}`).join(' ')}
+                fill="#dc2626" fillOpacity={0.85} stroke="#dc2626" strokeWidth={1.5}
+              />
+            </svg>
+          ) : <div className="h-32" />}
+          <div className="text-[10px] text-slate-400 text-center">位置</div>
         </div>
-      )}
-      <div className="flex items-center gap-1.5 flex-wrap">
-        <span className="text-xs text-slate-500">H=</span>
+        <div className="space-y-2 overflow-y-auto max-h-56">
+          {hints.length === 0 && (
+            <p className="text-xs text-slate-400">
+              區內沒有讀不出的標註——圖面可能沒標 H 值,或標註在區外。
+            </p>
+          )}
+          {hints.map((hint) => {
+            const cb = hint.cropBox;
+            const cw = cb ? cb[2] - cb[0] : 0;
+            const ch = cb ? cb[3] - cb[1] : 0;
+            const hl = cb && cw > 0 && ch > 0 ? {
+              left: `${((hint.x0 - cb[0]) / cw) * 100}%`,
+              width: `${((hint.x1 - hint.x0) / cw) * 100}%`,
+              top: `${((cb[3] - hint.y1) / ch) * 100}%`,
+              height: `${((hint.y1 - hint.y0) / ch) * 100}%`,
+            } : null;
+            return hint.crop ? (
+              <div key={hint.id} className="relative">
+                <img src={hint.crop} alt={hint.id} className="w-full h-auto rounded bg-white" />
+                {hl && (
+                  <div className="absolute rounded-sm bg-amber-300/25 border border-amber-400/80 pointer-events-none" style={hl} />
+                )}
+                <div className="text-[10px] text-slate-400 mt-0.5">機器猜「{hint.read || '?'}」</div>
+              </div>
+            ) : null;
+          })}
+        </div>
+      </div>
+
+      <div className="flex items-center gap-2 flex-wrap">
+        <span className="text-sm text-slate-500">H=</span>
         <input
           ref={inputRef}
           type="number"
@@ -1207,46 +1292,39 @@ function PendingZoneCard({
           min="0"
           value={val}
           onChange={(e) => setVal(e.target.value)}
-          className="w-16 rounded border border-slate-300 dark:border-slate-700 bg-transparent px-2 py-1 text-sm outline-none focus:ring-2 focus:ring-blue-500"
+          disabled={saving}
+          className="w-24 rounded-lg border border-slate-300 dark:border-slate-700 bg-transparent px-3 py-1.5 text-lg font-mono outline-none focus:ring-2 focus:ring-amber-500"
         />
         <button
           disabled={val === '' || saving}
-          onClick={async () => {
-            setSaving(true);
-            await onSave(zone.id, Number(val));
-            setSaving(false);
-          }}
-          className="px-2.5 py-1 bg-blue-600 hover:bg-blue-700 text-white rounded text-xs font-medium cursor-pointer disabled:opacity-50"
-        >
-          {saving ? '…' : '儲存'}
-        </button>
+          onClick={(e) => { e.stopPropagation(); void doSave(Number(val)); }}
+          className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-xs font-medium cursor-pointer disabled:opacity-50"
+        >儲存</button>
         <button
           disabled={saving}
-          onClick={async () => {
-            setSaving(true);
-            await onSave(zone.id, 'nolimit');
-            setSaving(false);
-          }}
-          className="px-2.5 py-1 border border-slate-300 dark:border-slate-600 text-slate-500 rounded text-xs cursor-pointer hover:border-amber-400 disabled:opacity-50"
-        >
-          無限制
-        </button>
+          onClick={(e) => { e.stopPropagation(); void doSave('nolimit'); }}
+          className="px-3 py-1.5 border border-slate-300 dark:border-slate-600 text-slate-500 rounded-lg text-xs cursor-pointer hover:border-amber-400 disabled:opacity-50"
+        >無限制</button>
         {suggest !== undefined && (
           <button
             disabled={saving}
-            onClick={async () => {
-              setSaving(true);
-              await onSave(zone.id, suggest);
-              setSaving(false);
-            }}
+            onClick={(e) => { e.stopPropagation(); void doSave(suggest); }}
             title="此區圖面有變更;確認限高沒改再套用"
-            className="px-2.5 py-1 border border-blue-300 dark:border-blue-800 text-blue-600 dark:text-blue-400 rounded text-xs cursor-pointer hover:bg-blue-50 dark:hover:bg-blue-900/20 disabled:opacity-50"
-          >
-            套用上一版:{suggest === 'nolimit' ? '無限制' : suggest}
-          </button>
+            className="px-3 py-1.5 border border-blue-300 dark:border-blue-800 text-blue-600 dark:text-blue-400 rounded-lg text-xs cursor-pointer hover:bg-blue-50 dark:hover:bg-blue-900/20 disabled:opacity-50"
+          >套用上一版:{suggest === 'nolimit' ? '無限制' : suggest}</button>
         )}
+        {saving && <Loader2 className="w-4 h-4 animate-spin text-amber-500" />}
       </div>
-    </div>
+
+      <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-slate-400 border-t border-slate-100 dark:border-slate-800 pt-2">
+        <span><kbd className="font-mono">Enter</kbd> 存檔→下一區</span>
+        <span><kbd className="font-mono">N</kbd> 無限制</span>
+        {suggest !== undefined && <span><kbd className="font-mono">S</kbd> 套用上一版</span>}
+        <span><kbd className="font-mono">↓/Tab</kbd> 跳過</span>
+        <span><kbd className="font-mono">↑</kbd> 上一區</span>
+        <span>也可點板圖上的虛線區直接跳到該區</span>
+      </div>
+    </section>
   );
 }
 
@@ -1324,5 +1402,246 @@ function ZoneEditCard({ zone, onSave, onClose }: {
         )}
       </div>
     </div>
+  );
+}
+
+/** 板卡管理:改名、備註、刪除(內建示範資料集不可刪)。 */
+function BoardManager({
+  boards,
+  onClose,
+  onChanged,
+}: {
+  boards: BoardInfo[];
+  onClose: () => void;
+  onChanged: (deletedId?: string) => Promise<void> | void;
+}) {
+  const [edits, setEdits] = useState<Record<string, { title: string; note: string }>>(
+    () => Object.fromEntries(boards.map((b) => [b.id, { title: b.title, note: b.note ?? '' }])),
+  );
+  const [busy, setBusy] = useState<string | null>(null);
+  const [confirmDel, setConfirmDel] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  const dirty = (b: BoardInfo) => {
+    const e = edits[b.id];
+    return !!e && (e.title !== b.title || e.note !== (b.note ?? ''));
+  };
+
+  const save = async (b: BoardInfo) => {
+    const e = edits[b.id];
+    if (!e || !e.title.trim()) return;
+    setBusy(b.id); setErr(null);
+    try {
+      const res = await fetch(`/api/heightcheck/board/${b.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: e.title, note: e.note || null }),
+      });
+      if (!res.ok) throw new Error((await res.json())?.error ?? `HTTP ${res.status}`);
+      await onChanged();
+    } catch (ex) {
+      setErr(ex instanceof Error ? ex.message : '儲存失敗');
+    } finally { setBusy(null); }
+  };
+
+  const remove = async (b: BoardInfo) => {
+    setBusy(b.id); setErr(null);
+    try {
+      const res = await fetch(`/api/heightcheck/board/${b.id}`, { method: 'DELETE' });
+      if (!res.ok) throw new Error((await res.json())?.error ?? `HTTP ${res.status}`);
+      setConfirmDel(null);
+      await onChanged(b.id);
+    } catch (ex) {
+      setErr(ex instanceof Error ? ex.message : '刪除失敗');
+    } finally { setBusy(null); }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 p-4" onClick={onClose}>
+      <div
+        className="w-full max-w-2xl max-h-[80vh] overflow-y-auto rounded-2xl bg-white dark:bg-slate-950 border border-slate-200 dark:border-slate-800 shadow-2xl p-5 space-y-3"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center gap-2">
+          <SlidersHorizontal className="w-4 h-4 text-slate-500" />
+          <h3 className="text-sm font-semibold">管理板卡</h3>
+          <button onClick={onClose} className="ml-auto text-slate-400 hover:text-slate-600 cursor-pointer" title="Esc 關閉">
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+        {err && (
+          <div className="rounded-lg border border-red-200 dark:border-red-900/50 bg-red-50 dark:bg-red-900/20 px-3 py-2 text-xs text-red-600 dark:text-red-400">
+            {err}
+          </div>
+        )}
+        {boards.map((b) => (
+          <div key={b.id} className="rounded-xl border border-slate-200 dark:border-slate-800 p-3 space-y-2">
+            <div className="flex items-center gap-2 text-xs text-slate-400 font-mono">
+              <span>{b.id}</span>
+              <span className="rounded px-1.5 py-0.5 bg-slate-100 dark:bg-slate-800">
+                {b.source === 'upload' ? '上傳' : '內建示範'}
+              </span>
+              {b.extractedAt && <span>{new Date(b.extractedAt).toLocaleDateString('zh-TW')}</span>}
+              {(b.dxf || b.stp) && (
+                <span className="truncate max-w-[16rem]" title={`${b.dxf ?? ''} / ${b.stp ?? ''}`}>
+                  {b.dxf}{b.stp ? ` / ${b.stp}` : ''}
+                </span>
+              )}
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <input
+                value={edits[b.id]?.title ?? b.title}
+                onChange={(e) => setEdits({ ...edits, [b.id]: { title: e.target.value, note: edits[b.id]?.note ?? b.note ?? '' } })}
+                placeholder="板卡名稱"
+                className="flex-1 min-w-[10rem] rounded-lg border border-slate-300 dark:border-slate-700 bg-transparent px-2 py-1 text-sm outline-none focus:ring-2 focus:ring-blue-500"
+              />
+              <input
+                value={edits[b.id]?.note ?? b.note ?? ''}
+                onChange={(e) => setEdits({ ...edits, [b.id]: { title: edits[b.id]?.title ?? b.title, note: e.target.value } })}
+                placeholder="備註(專案 / 版次 / 日期…)"
+                className="flex-[2] min-w-[12rem] rounded-lg border border-slate-300 dark:border-slate-700 bg-transparent px-2 py-1 text-sm outline-none focus:ring-2 focus:ring-blue-500"
+              />
+              <button
+                disabled={!dirty(b) || busy === b.id || !(edits[b.id]?.title ?? b.title).trim()}
+                onClick={() => save(b)}
+                className="px-3 py-1 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-xs font-medium cursor-pointer disabled:opacity-40"
+              >
+                {busy === b.id ? '…' : '儲存'}
+              </button>
+              {b.source === 'upload' && (confirmDel === b.id ? (
+                <span className="flex items-center gap-1.5">
+                  <button
+                    disabled={busy === b.id}
+                    onClick={() => remove(b)}
+                    className="px-3 py-1 bg-red-600 hover:bg-red-700 text-white rounded-lg text-xs font-medium cursor-pointer disabled:opacity-40"
+                  >
+                    確認永久刪除
+                  </button>
+                  <button
+                    onClick={() => setConfirmDel(null)}
+                    className="px-2 py-1 text-xs text-slate-400 hover:text-slate-600 cursor-pointer"
+                  >
+                    取消
+                  </button>
+                </span>
+              ) : (
+                <button
+                  onClick={() => setConfirmDel(b.id)}
+                  title="刪除整個資料集(含手填的 H 值),不可復原"
+                  className="px-3 py-1 border border-red-300 dark:border-red-900 text-red-500 rounded-lg text-xs cursor-pointer hover:bg-red-50 dark:hover:bg-red-900/20"
+                >
+                  刪除
+                </button>
+              ))}
+            </div>
+          </div>
+        ))}
+        <p className="text-[11px] text-slate-400">
+          刪除會移除該板的整個資料集(含手填 H 值與判定),不可復原;若有用 OneDrive 同步,雲端那份不受影響。
+        </p>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * 資料集搬移:把整片板子(含你填的限高值)打包成 zip 帶去別台電腦或給同事,
+ * 對方在自己的網頁按「匯入資料集」即可,不需要碰檔案總管或重跑管線。
+ */
+function DatasetTransfer({ boardId, onImported }: {
+  boardId: string | null;
+  onImported: (id: string) => void;
+}) {
+  const fileRef = useRef<HTMLInputElement>(null);
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
+
+  const doImport = async (file: File) => {
+    setBusy(true);
+    setMsg(null);
+    try {
+      const fd = new FormData();
+      fd.append('file', file);
+      const res = await fetch('/api/heightcheck/import', { method: 'POST', body: fd });
+      const j = await res.json();
+      if (!res.ok) throw new Error(j?.error || `HTTP ${res.status}`);
+      setMsg({
+        kind: 'ok',
+        text: `已匯入「${j.board.title}」(${j.files} 個檔案`
+          + `${j.renamed ? `;原 id ${j.renamed} 已被占用,改用 ${j.board.id}` : ''})`,
+      });
+      onImported(j.board.id);
+    } catch (e) {
+      setMsg({ kind: 'err', text: e instanceof Error ? e.message : '匯入失敗' });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <>
+      <div className="inline-flex rounded-lg border border-slate-300 dark:border-slate-700 overflow-hidden text-sm font-medium">
+        <a
+          href={boardId ? `/api/heightcheck/export/${boardId}` : undefined}
+          download
+          aria-disabled={!boardId}
+          className={cn(
+            'px-3 py-1.5 flex items-center space-x-2 text-slate-600 dark:text-slate-300 transition-colors',
+            boardId
+              ? 'hover:bg-slate-100 dark:hover:bg-slate-800 hover:text-blue-600 dark:hover:text-blue-400 cursor-pointer'
+              : 'opacity-40 pointer-events-none',
+          )}
+          title="打包這片板卡的資料集 + 你填的限高值(labels/zone_overrides),約 2–3 MB;對方用「匯入資料集」收檔即可"
+        >
+          <FolderDown className="w-4 h-4" />
+          <span>匯出資料集</span>
+        </a>
+        <a
+          href={boardId ? `/api/heightcheck/export/${boardId}?full=1` : undefined}
+          download
+          aria-disabled={!boardId}
+          className={cn(
+            'px-2.5 py-1.5 border-l border-slate-300 dark:border-slate-700 text-xs text-slate-500 dark:text-slate-400 flex items-center transition-colors',
+            boardId
+              ? 'hover:bg-slate-100 dark:hover:bg-slate-800 hover:text-blue-600 dark:hover:text-blue-400 cursor-pointer'
+              : 'opacity-40 pointer-events-none',
+          )}
+          title="另含 input.dxf / input.stp(約 +26 MB),對方才能在自己電腦上「更換 DXF / STP」重跑"
+        >
+          ＋CAD 原檔
+        </a>
+      </div>
+      <button
+        onClick={() => fileRef.current?.click()}
+        disabled={busy}
+        className="px-4 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:border-blue-500 hover:text-blue-600 dark:hover:text-blue-400 disabled:opacity-50 text-sm font-medium flex items-center space-x-2 cursor-pointer"
+        title="匯入別台電腦匯出的資料集 zip(也吃直接壓縮整個資料集資料夾的 zip)"
+      >
+        {busy ? <Spinner className="w-4 h-4 animate-spin" /> : <FolderUp className="w-4 h-4" />}
+        <span>{busy ? '匯入中…' : '匯入資料集'}</span>
+      </button>
+      <input
+        ref={fileRef}
+        type="file"
+        accept=".zip,application/zip"
+        hidden
+        onChange={(e) => {
+          const f = e.target.files?.[0];
+          e.target.value = '';
+          if (f) void doImport(f);
+        }}
+      />
+      {msg && (
+        <span className={cn('text-xs max-w-md', msg.kind === 'ok' ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400')}>
+          {msg.text}
+        </span>
+      )}
+    </>
   );
 }

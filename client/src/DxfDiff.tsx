@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
-  GitCompareArrows, Loader2, AlertTriangle, Play, ZoomIn, MapPin,
+  GitCompareArrows, Loader2, AlertTriangle, Play, ZoomIn, MapPin, Crosshair,
 } from 'lucide-react';
 import { cn } from './lib/utils';
 import { FilePick } from './UploadWizard';
@@ -24,17 +24,36 @@ interface DiffRegion {
   removedPx: number; addedPx: number;
 }
 
+/** server 端(run_pipeline.py diff)算出的對位結果 */
+interface DiffAlign {
+  applied: boolean;
+  dx: number; dy: number;
+  consensusPct: number | null;
+  crossCheckMm: number | null;
+  outliers?: number;
+  reason: 'auto' | 'already_aligned' | 'low_consensus' | 'manual' | 'disabled'
+    | 'no_features' | null;
+  hint?: string;
+  /** 共識不足時的多位移分析:每個位移及其特徵分布 */
+  models?: { dx: number; dy: number; features: number; pct: number; bbox: number[] }[];
+  regions?: { name: string; dx: number; dy: number; consensusPct: number; features: number }[];
+  suggest?: { dx: number; dy: number; bbox: number[] };
+}
+
 interface DiffMeta {
   x0: number; y0: number; x1: number; y1: number;
   pxw: number; pxh: number;
   removedPx: number; addedPx: number;
   regions: DiffRegion[];
   regionsTotal: number;
+  align?: DiffAlign;
 }
 
-type ImgMode = 'diff' | 'a' | 'b';
+type ImgMode = 'diff' | 'a' | 'b' | 'overlay';
 
-const MODE_LABEL: Record<ImgMode, string> = { diff: '差異', a: '舊版', b: '新版' };
+const MODE_LABEL: Record<ImgMode, string> = {
+  diff: '差異', a: '舊版', b: '新版', overlay: '疊圖微調',
+};
 
 export default function DxfDiff() {
   const [fileA, setFileA] = useState<File | null>(null);
@@ -47,6 +66,10 @@ export default function DxfDiff() {
 
   const [mode, setMode] = useState<ImgMode>('diff');
   const [zoom, setZoom] = useState(1);
+  const [noAlign, setNoAlign] = useState(false);
+  /** 疊圖微調中的位移(mm,圖面座標);按「用這個位移重新比對」才會真的重算 */
+  const [nudge, setNudge] = useState<{ dx: number; dy: number }>({ dx: 0, dy: 0 });
+  const [realigning, setRealigning] = useState(false);
   const [selRegion, setSelRegion] = useState<number | null>(null);
   const [zoomRegion, setZoomRegion] = useState<{ idx: number; x0: number; y0: number; x1: number; y1: number } | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -83,6 +106,7 @@ export default function DxfDiff() {
       const fd = new FormData();
       fd.append('dxfA', fileA);
       fd.append('dxfB', fileB);
+      if (noAlign) fd.append('noAlign', 'true');
       const res = await fetch('/api/dxfdiff', { method: 'POST', body: fd });
       const data = await res.json();
       if (!res.ok) throw new Error(data?.error || `HTTP ${res.status}`);
@@ -104,7 +128,10 @@ export default function DxfDiff() {
         if (data.phase === 'done') {
           clearInterval(t);
           const m = await fetch(`/api/dxfdiff/${jobId}/diff.json`);
-          setMeta((await m.json()) as DiffMeta);
+          const parsed = (await m.json()) as DiffMeta;
+          setMeta(parsed);
+          setNudge({ dx: parsed.align?.dx ?? 0, dy: parsed.align?.dy ?? 0 });
+          setRealigning(false);
         }
         if (data.phase === 'error') clearInterval(t);
       } catch { /* transient */ }
@@ -139,7 +166,41 @@ export default function DxfDiff() {
     });
   }
 
-  const running = status && status.phase === 'running';
+  /** 用指定位移(或關閉對位)重跑同一對 DXF */
+  const realign = async (opt: { dx?: number; dy?: number; noAlign?: boolean }) => {
+    if (!jobId) return;
+    setRealigning(true); setError(null);
+    try {
+      const res = await fetch(`/api/dxfdiff/${jobId}/realign`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(opt),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error || `HTTP ${res.status}`);
+      setMeta(null); setSelRegion(null);       // 清掉 meta 會讓輪詢重新啟動
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '重新比對失敗');
+      setRealigning(false);
+    }
+  };
+
+  // 疊圖模式:方向鍵微調位移(Shift = 1mm、預設 0.1mm)
+  useEffect(() => {
+    if (mode !== 'overlay' || !meta) return;
+    const onKey = (e: KeyboardEvent) => {
+      const step = e.shiftKey ? 1 : 0.1;
+      const d = { ArrowLeft: [-step, 0], ArrowRight: [step, 0],
+                  ArrowUp: [0, step], ArrowDown: [0, -step] }[e.key];
+      if (!d) return;
+      e.preventDefault();
+      setNudge((n) => ({ dx: Math.round((n.dx + d[0]) * 1000) / 1000,
+                         dy: Math.round((n.dy + d[1]) * 1000) / 1000 }));
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [mode, meta]);
+
+  const running = (status && status.phase === 'running') || realigning;
 
   return (
     <div className="space-y-6">
@@ -160,8 +221,17 @@ export default function DxfDiff() {
             <span>開始比對</span>
           </button>
         </div>
+        <label className="flex items-center gap-2 text-xs text-slate-500 cursor-pointer w-fit">
+          <input
+            type="checkbox" checked={noAlign}
+            onChange={(e) => setNoAlign(e.target.checked)}
+            className="accent-blue-600"
+          />
+          <span>不要自動對齊(直接用圖面原始座標比對)</span>
+        </label>
         <p className="text-xs text-slate-400">
-          兩版圖面需來自同一張圖框(相同座標系統的 CAD 輸出);整張圖會以相同範圍渲染後逐像素比對。
+          兩版座標若在建圖過程中整體跑掉,會先用孔位比對自動量出位移並對齊(共識不足時不會硬套,
+          會告訴你原因);之後仍可在「疊圖微調」手動調整。
         </p>
 
         {status && status.phase !== 'done' && (
@@ -192,9 +262,17 @@ export default function DxfDiff() {
 
       {meta && jobId && (
         <section className="border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-950 rounded-xl p-4 shadow-sm space-y-3">
+          <AlignPanel
+            align={meta.align}
+            nudge={nudge}
+            onNudge={setNudge}
+            busy={!!realigning}
+            onRealign={realign}
+            onOverlay={() => setMode('overlay')}
+          />
           <div className="flex flex-wrap items-center gap-3 text-sm">
             <div className="flex rounded-lg border border-slate-300 dark:border-slate-700 overflow-hidden">
-              {(['diff', 'a', 'b'] as ImgMode[]).map((m) => (
+              {(['diff', 'a', 'b', 'overlay'] as ImgMode[]).map((m) => (
                 <button
                   key={m}
                   onClick={() => setMode(m)}
@@ -240,12 +318,35 @@ export default function DxfDiff() {
               className="relative flex-1 overflow-auto max-h-[70vh] border border-slate-200 dark:border-slate-800 rounded-lg bg-white"
             >
               <div className="relative" style={{ width: `${zoom * 100}%` }}>
+                {mode === 'overlay' ? (
+                  <div className="relative bg-white">
+                    <img
+                      src={`/api/dxfdiff/${jobId}/img/a.jpg`}
+                      alt="舊版" className="w-full h-auto block select-none" draggable={false}
+                    />
+                    {/* b.jpg 已經套了伺服器算出的位移,所以這裡只再平移「差額」 */}
+                    <img
+                      src={`/api/dxfdiff/${jobId}/img/b.jpg`}
+                      alt="新版"
+                      className="absolute inset-0 w-full h-auto block select-none"
+                      draggable={false}
+                      style={{
+                        mixBlendMode: 'difference',
+                        filter: 'invert(1)',
+                        transform: `translate(${((nudge.dx - (meta.align?.applied ? meta.align.dx : 0))
+                          / (meta.x1 - meta.x0)) * 100}%, ${(-(nudge.dy - (meta.align?.applied ? meta.align.dy : 0))
+                          / (meta.y1 - meta.y0)) * 100}%)`,
+                      }}
+                    />
+                  </div>
+                ) : (
                 <img
                   src={`/api/dxfdiff/${jobId}/img/${mode}.jpg`}
                   alt={MODE_LABEL[mode]}
                   className="w-full h-auto block select-none"
                   draggable={false}
                 />
+                )}
                 {mode === 'diff' && meta.regions.map((r, i) => (
                   <button
                     key={i}
@@ -398,6 +499,133 @@ function ZoomModal({ jobId, region, onClose }: {
           />
         </div>
       </div>
+    </div>
+  );
+}
+
+/**
+ * 對位狀態面板:顯示伺服器量到的位移與共識比例,並提供手動微調。
+ * 設計原則是「對位是在決定什麼算沒改」,所以一定要讓使用者看得到、關得掉、改得動。
+ */
+function AlignPanel({ align, nudge, onNudge, busy, onRealign, onOverlay }: {
+  align?: DiffAlign;
+  nudge: { dx: number; dy: number };
+  onNudge: (n: { dx: number; dy: number }) => void;
+  busy: boolean;
+  onRealign: (o: { dx?: number; dy?: number; noAlign?: boolean }) => void;
+  onOverlay: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  if (!align) return null;
+
+  const mm = (v: number) => `${v >= 0 ? '+' : ''}${v.toFixed(3)}`;
+  const tone = align.applied
+    ? 'border-blue-200 dark:border-blue-900/50 bg-blue-50 dark:bg-blue-900/20'
+    : align.reason === 'low_consensus'
+      ? 'border-amber-300 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-900/20'
+      : 'border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900';
+  const headline = align.reason === 'manual'
+    ? `使用手動指定的位移 X ${mm(align.dx)}、Y ${mm(align.dy)} mm`
+    : align.applied
+      ? `已自動對齊 X ${mm(align.dx)}、Y ${mm(align.dy)} mm`
+      : align.reason === 'already_aligned'
+        ? '兩版座標本來就對齊,未套用位移'
+        : align.reason === 'low_consensus'
+          ? '自動對位不可信,未套用'
+          : align.reason === 'disabled'
+            ? '已停用自動對位'
+            : '找不到可對位的特徵';
+
+  return (
+    <div className={cn('rounded-lg border px-3 py-2 text-sm space-y-2', tone)}>
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+        <Crosshair className={cn('w-4 h-4 shrink-0',
+          align.applied ? 'text-blue-500' : align.reason === 'low_consensus' ? 'text-amber-500' : 'text-slate-400')} />
+        <span className="font-medium">{headline}</span>
+        {align.consensusPct !== null && (
+          <span className="text-xs text-slate-500">
+            孔位共識 {align.consensusPct}%
+            {align.crossCheckMm !== null && `,線段交叉驗證差 ${align.crossCheckMm} mm`}
+            {align.outliers !== undefined && `,${align.outliers} 個特徵對不上`}
+          </span>
+        )}
+        <button
+          onClick={() => setOpen((o) => !o)}
+          className="ml-auto text-xs text-blue-600 dark:text-blue-400 hover:underline cursor-pointer"
+        >
+          {open ? '收起' : '調整對位'}
+        </button>
+      </div>
+
+      {align.hint && <p className="text-xs text-amber-700 dark:text-amber-300">{align.hint}</p>}
+
+      {align.models && align.models.length > 1 && (
+        <ul className="text-xs text-slate-600 dark:text-slate-300 space-y-0.5">
+          {align.models.map((m, i) => (
+            <li key={i} className="flex flex-wrap items-center gap-2">
+              <span className="font-mono">X {mm(m.dx)} / Y {mm(m.dy)} mm</span>
+              <span className="text-slate-400">
+                {m.pct}% 的特徵({m.features} 個),分布 ({m.bbox[0]}, {m.bbox[1]})–({m.bbox[2]}, {m.bbox[3]}) mm
+              </span>
+              {(m.dx !== align.dx || m.dy !== align.dy) && (
+                <button
+                  onClick={() => onRealign({ dx: m.dx, dy: m.dy })}
+                  disabled={busy}
+                  className="text-blue-600 dark:text-blue-400 hover:underline cursor-pointer disabled:opacity-50"
+                >
+                  用這個位移重新比對
+                </button>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {align.regions && align.regions.length > 0 && (
+        <ul className="text-xs text-slate-500 space-y-0.5">
+          {align.regions.map((r) => (
+            <li key={r.name} className="font-mono">
+              {r.name}:X {mm(r.dx)} / Y {mm(r.dy)} mm(共識 {r.consensusPct}%,{r.features} 個特徵)
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {open && (
+        <div className="flex flex-wrap items-end gap-3 pt-1 border-t border-slate-200 dark:border-slate-800">
+          {(['dx', 'dy'] as const).map((k) => (
+            <label key={k} className="text-xs text-slate-500 space-y-1">
+              <span className="block">{k === 'dx' ? 'X 位移 (mm)' : 'Y 位移 (mm)'}</span>
+              <input
+                type="number" step={0.1} value={nudge[k]}
+                onChange={(e) => onNudge({ ...nudge, [k]: Number(e.target.value) })}
+                className="w-24 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-2 py-1 font-mono outline-none focus:ring-2 focus:ring-blue-500"
+              />
+            </label>
+          ))}
+          <button
+            onClick={onOverlay}
+            className="px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 text-xs font-medium hover:bg-white dark:hover:bg-slate-800 cursor-pointer"
+            title="兩版疊在一起,方向鍵微調(Shift = 1mm);對齊時線條會消失"
+          >
+            疊圖微調(方向鍵)
+          </button>
+          <button
+            onClick={() => onRealign({ dx: nudge.dx, dy: nudge.dy })}
+            disabled={busy}
+            className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium cursor-pointer disabled:opacity-50"
+          >
+            {busy ? '重新比對中…' : '用這個位移重新比對'}
+          </button>
+          <button
+            onClick={() => onRealign({ noAlign: true })}
+            disabled={busy}
+            className="text-xs text-slate-500 hover:underline cursor-pointer disabled:opacity-50"
+          >
+            不要對位
+          </button>
+        </div>
+      )}
     </div>
   );
 }

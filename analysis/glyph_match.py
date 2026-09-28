@@ -20,7 +20,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DXF = os.path.join(HERE, '..', 'samples', 'ux3607_nvl_mb_dxf_20260625.dxf')
 TEMPLATES = os.path.join(HERE, 'glyph_templates.json')
 
-MAX_SEG = 8.0        # mm — glyph strokes only
+MAX_SEG = 14.0       # mm — glyph strokes only (橫幅級大字的筆畫可達 ~12mm;
+                     # 148 標註 ground truth 在 8/12/16 下同為 125 對、0 靜默錯誤,
+                     # 而字形擦除永遠擦不掉 >8mm 的實體(protect-2),所以放寬是安全的)
 PIECE_GAP = 0.38     # mm — sub-cluster gap that separates characters
 SAMPLE_STEP = 0.04   # normalized units between sampled points
 DOT_MAX_H = 0.30     # piece height/width (normalized to label height) of a dot-sized piece
